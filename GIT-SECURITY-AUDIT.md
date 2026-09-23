@@ -42,3 +42,18 @@ python app.py
 ```
 
 No EXE/MSIX instalado, essas ações permanecem desabilitadas para evitar operar sobre uma pasta que não é o repositório fonte.
+
+
+## v2.24.1 — múltiplos projetos
+
+O dashboard Git/GitHub passou a trabalhar com uma lista local de projetos.
+A seleção é persistida fora dos repositórios em:
+
+`%LOCALAPPDATA%\TechToolHub\git_projects.json`
+
+A checagem, commit, sincronização, push e Release usam exclusivamente o
+repositório do projeto selecionado.
+
+Antes do push, o fluxo executa `git fetch origin` e, quando o remoto está
+à frente, `git pull --rebase origin <branch>`. Se houver conflito, o rebase
+é abortado para preservar o estado anterior e o push não é realizado.

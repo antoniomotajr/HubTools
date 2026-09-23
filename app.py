@@ -80,6 +80,7 @@ USER_MEDIA_DIR = APP_DATA_DIR / "user_media"
 ICONS_DIR = APP_DATA_DIR / "icons"
 CATALOG_MIGRATION_FILE = APP_DATA_DIR / ".apps_catalog_v1_done"
 OFFICIAL_ICONS_MIGRATION_FILE = APP_DATA_DIR / ".official_icons_v1_done"
+GIT_PROJECTS_FILE = APP_DATA_DIR / "git_projects.json"
 
 # A marca é recurso do aplicativo e permanece somente leitura no MSIX.
 BRAND_IMAGE_FILE = RESOURCE_DIR / "brand_logo.png"
@@ -90,6 +91,7 @@ LOCAL_APPS_LOCK = threading.RLock()
 PROJECTS_LOCK = threading.RLock()
 USER_PROFILE_LOCK = threading.RLock()
 BUILD_LOCK = threading.RLock()
+GIT_PROJECTS_LOCK = threading.RLock()
 
 BUILD_STATE: dict[str, Any] = {
     "running": False,
@@ -128,7 +130,7 @@ ALLOWED_ICON_TYPES = {
 app = FastAPI(
     title=APP_TITLE,
     description="Hub local para centralização e gerenciamento de ferramentas.",
-    version="2.24.0",
+    version="2.24.1",
 )
 
 
@@ -496,6 +498,28 @@ SECURITY_SCAN_SKIP_NAMES = {
     "GIT-SECURITY-AUDIT.md",
 }
 
+RELEASE_ALLOWED_SUFFIXES = {
+    ".msix",
+    ".msixbundle",
+    ".appx",
+    ".appxbundle",
+    ".msi",
+    ".exe",
+    ".zip",
+    ".7z",
+    ".gz",
+    ".whl",
+    ".cer",
+}
+
+RELEASE_PRIVATE_SUFFIXES = {
+    ".pfx",
+    ".p12",
+    ".pem",
+    ".key",
+    ".ppk",
+}
+
 
 def _run_process(
     args: list[str],
@@ -504,6 +528,10 @@ def _run_process(
     timeout: int = 60,
 ) -> dict[str, Any]:
     """Executa um comando local sem shell e captura saída."""
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
     try:
         completed = subprocess.run(
             args,
@@ -515,6 +543,7 @@ def _run_process(
             errors="replace",
             timeout=timeout,
             shell=False,
+            creationflags=creationflags,
         )
     except FileNotFoundError:
         return {
@@ -537,48 +566,319 @@ def _run_process(
     }
 
 
-def _git_repo_root() -> Path | None:
-    if not shutil.which("git"):
+def _clean_project_path(value: str | Path) -> Path | None:
+    raw = str(value or "").strip().strip('"')
+    if not raw:
+        return None
+
+    try:
+        candidate = Path(os.path.expandvars(os.path.expanduser(raw))).resolve()
+    except (OSError, RuntimeError):
+        return None
+
+    if not candidate.is_dir():
+        return None
+
+    return candidate
+
+
+def _repo_root_from_path(project_path: str | Path) -> Path | None:
+    """Resolve a raiz Git a partir de qualquer pasta interna do projeto."""
+    project_dir = _clean_project_path(project_path)
+    if project_dir is None or not shutil.which("git"):
         return None
 
     result = _run_process(
         ["git", "rev-parse", "--show-toplevel"],
-        cwd=SOURCE_DIR,
+        cwd=project_dir,
         timeout=15,
     )
     if not result["ok"] or not result["output"]:
         return None
 
     try:
-        return Path(result["output"].splitlines()[-1]).resolve()
-    except OSError:
+        repo_root = Path(result["output"].splitlines()[-1]).resolve()
+    except (OSError, RuntimeError):
         return None
+
+    return repo_root if repo_root.is_dir() else None
+
+
+def _default_git_projects_state() -> dict[str, Any]:
+    source_root = _repo_root_from_path(SOURCE_DIR)
+    if source_root is None:
+        return {
+            "selected_path": "",
+            "projects": [],
+        }
+
+    return {
+        "selected_path": str(source_root),
+        "projects": [
+            {
+                "path": str(source_root),
+                "name": source_root.name,
+            }
+        ],
+    }
+
+
+def _load_git_projects_state() -> dict[str, Any]:
+    with GIT_PROJECTS_LOCK:
+        state: dict[str, Any] = {}
+
+        if GIT_PROJECTS_FILE.is_file():
+            try:
+                loaded = json.loads(
+                    GIT_PROJECTS_FILE.read_text(
+                        encoding="utf-8-sig"
+                    )
+                )
+                if isinstance(loaded, dict):
+                    state = loaded
+            except (OSError, json.JSONDecodeError):
+                state = {}
+
+        if not state:
+            state = _default_git_projects_state()
+
+        raw_projects = state.get("projects", [])
+        clean_projects: list[dict[str, str]] = []
+        seen: set[str] = set()
+
+        if isinstance(raw_projects, list):
+            for item in raw_projects:
+                if not isinstance(item, dict):
+                    continue
+
+                candidate = _clean_project_path(
+                    str(item.get("path", ""))
+                )
+                if candidate is None:
+                    continue
+
+                normalized = str(candidate)
+                key = normalized.lower() if os.name == "nt" else normalized
+
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                clean_projects.append({
+                    "path": normalized,
+                    "name": str(
+                        item.get("name") or candidate.name
+                    ).strip() or candidate.name,
+                })
+
+        selected = _clean_project_path(
+            str(state.get("selected_path", ""))
+        )
+
+        if selected is None and clean_projects:
+            selected = Path(clean_projects[0]["path"])
+
+        if selected is None:
+            default_state = _default_git_projects_state()
+            default_selected = _clean_project_path(
+                str(default_state.get("selected_path", ""))
+            )
+            if default_selected is not None:
+                selected = default_selected
+                if not any(
+                    item["path"].lower() == str(selected).lower()
+                    if os.name == "nt"
+                    else item["path"] == str(selected)
+                    for item in clean_projects
+                ):
+                    clean_projects.insert(
+                        0,
+                        {
+                            "path": str(selected),
+                            "name": selected.name,
+                        },
+                    )
+
+        normalized_state = {
+            "selected_path": str(selected) if selected else "",
+            "projects": clean_projects[:30],
+        }
+
+        try:
+            GIT_PROJECTS_FILE.write_text(
+                json.dumps(
+                    normalized_state,
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+        return normalized_state
+
+
+def _save_git_projects_state(state: dict[str, Any]) -> None:
+    with GIT_PROJECTS_LOCK:
+        GIT_PROJECTS_FILE.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        GIT_PROJECTS_FILE.write_text(
+            json.dumps(
+                state,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+
+def _remember_git_project(
+    project_path: str | Path,
+    *,
+    activate: bool = True,
+) -> dict[str, Any]:
+    candidate = _clean_project_path(project_path)
+    if candidate is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A pasta selecionada não existe ou não pode ser acessada.",
+        )
+
+    repo_root = _repo_root_from_path(candidate)
+    stored_path = repo_root or candidate
+    state = _load_git_projects_state()
+
+    project_item = {
+        "path": str(stored_path),
+        "name": stored_path.name,
+    }
+
+    projects = [
+        item for item in state.get("projects", [])
+        if str(item.get("path", "")).lower()
+        != str(stored_path).lower()
+    ]
+    projects.insert(0, project_item)
+
+    state["projects"] = projects[:30]
+    if activate:
+        state["selected_path"] = str(stored_path)
+
+    _save_git_projects_state(state)
+
+    return {
+        "selected_path": str(stored_path),
+        "repo_root": str(repo_root) if repo_root else "",
+        "is_git": repo_root is not None,
+        "name": stored_path.name,
+    }
+
+
+def _selected_project_path() -> Path | None:
+    state = _load_git_projects_state()
+    return _clean_project_path(
+        str(state.get("selected_path", ""))
+    )
+
+
+def _git_repo_root() -> Path | None:
+    selected = _selected_project_path()
+    if selected is None:
+        return None
+    return _repo_root_from_path(selected)
 
 
 def _is_source_git_mode() -> tuple[bool, str]:
-    if bool(getattr(sys, "frozen", False)):
-        return (
-            False,
-            "As funções Git/GitHub precisam ser executadas na pasta fonte com 'python app.py'.",
-        )
-
+    """Compatibilidade: agora valida o projeto selecionado, não só HubTools."""
     if not shutil.which("git"):
         return False, "Git não foi encontrado no PATH."
 
-    repo_root = _git_repo_root()
+    selected = _selected_project_path()
+    if selected is None:
+        return False, "Nenhuma pasta de projeto está selecionada."
+
+    repo_root = _repo_root_from_path(selected)
     if repo_root is None:
-        return False, "A pasta atual não pertence a um repositório Git."
+        return (
+            False,
+            "A pasta selecionada ainda não é um repositório Git.",
+        )
 
     return True, ""
 
 
-def _git_output(args: list[str], timeout: int = 30) -> str:
-    repo_root = _git_repo_root()
-    if repo_root is None:
+def _git_output(
+    args: list[str],
+    timeout: int = 30,
+    *,
+    repo_root: Path | None = None,
+) -> str:
+    root = repo_root or _git_repo_root()
+    if root is None:
         return ""
 
-    result = _run_process(["git", *args], cwd=repo_root, timeout=timeout)
+    result = _run_process(
+        ["git", *args],
+        cwd=root,
+        timeout=timeout,
+    )
     return result["output"] if result["ok"] else ""
+
+
+def _choose_project_folder() -> str:
+    """Abre seletor nativo no Windows e retorna a pasta escolhida."""
+    if os.name != "nt":
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="O seletor nativo de pasta está disponível no Windows.",
+        )
+
+    powershell = (
+        shutil.which("powershell.exe")
+        or shutil.which("powershell")
+    )
+    if not powershell:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Windows PowerShell não foi encontrado.",
+        )
+
+    script = (
+        "$ErrorActionPreference='Stop';"
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+        "$shell=New-Object -ComObject Shell.Application;"
+        "$folder=$shell.BrowseForFolder("
+        "0,'Selecione a pasta do projeto',0,0);"
+        "if($null -ne $folder){$folder.Self.Path}"
+    )
+
+    result = _run_process(
+        [
+            powershell,
+            "-NoProfile",
+            "-STA",
+            "-Command",
+            script,
+        ],
+        cwd=Path.home(),
+        timeout=300,
+    )
+
+    if not result["ok"]:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=result["output"] or "Falha ao abrir o seletor de pasta.",
+        )
+
+    lines = [
+        line.strip()
+        for line in result["output"].splitlines()
+        if line.strip()
+    ]
+    return lines[-1] if lines else ""
 
 
 def _matches_any(path: str, patterns: list[str]) -> str | None:
@@ -623,7 +923,10 @@ def _git_candidate_files(repo_root: Path) -> list[str]:
     })
 
 
-def _scan_file_for_secrets(repo_root: Path, relative_path: str) -> list[dict[str, Any]]:
+def _scan_file_for_secrets(
+    repo_root: Path,
+    relative_path: str,
+) -> list[dict[str, Any]]:
     path = (repo_root / relative_path).resolve()
 
     try:
@@ -637,19 +940,28 @@ def _scan_file_for_secrets(repo_root: Path, relative_path: str) -> list[dict[str
     if path.name in SECURITY_SCAN_SKIP_NAMES:
         return []
 
-    if path.suffix.lower() not in SECURITY_TEXT_EXTENSIONS and not path.name.startswith(".env"):
+    if (
+        path.suffix.lower() not in SECURITY_TEXT_EXTENSIONS
+        and not path.name.startswith(".env")
+    ):
         return []
 
     try:
         if path.stat().st_size > 2 * 1024 * 1024:
             return []
-        content = path.read_text(encoding="utf-8", errors="replace")
+        content = path.read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
     except OSError:
         return []
 
     findings: list[dict[str, Any]] = []
 
-    for line_number, line in enumerate(content.splitlines(), start=1):
+    for line_number, line in enumerate(
+        content.splitlines(),
+        start=1,
+    ):
         for finding_type, pattern in SECRET_PATTERNS:
             if not pattern.search(line):
                 continue
@@ -663,18 +975,24 @@ def _scan_file_for_secrets(repo_root: Path, relative_path: str) -> list[dict[str
                 "type": finding_type,
                 "file": relative_path,
                 "line": line_number,
-                "message": "Possível segredo/credencial encontrado no conteúdo.",
+                "message": (
+                    "Possível segredo/credencial encontrado "
+                    "no conteúdo."
+                ),
                 "preview": preview,
             })
 
     return findings
 
 
-def run_git_security_audit() -> dict[str, Any]:
-    """Audita candidatos que poderiam entrar no próximo commit."""
+def run_git_security_audit(
+    repo_root: Path | None = None,
+) -> dict[str, Any]:
+    """Audita candidatos do projeto atualmente selecionado."""
     available, reason = _is_source_git_mode()
+    root = repo_root or _git_repo_root()
 
-    if not available:
+    if not available or root is None:
         return {
             "available": False,
             "reason": reason,
@@ -683,16 +1001,17 @@ def run_git_security_audit() -> dict[str, Any]:
             "warning_count": 0,
             "findings": [],
             "candidate_count": 0,
+            "tracked_count": 0,
         }
 
-    repo_root = _git_repo_root()
-    assert repo_root is not None
-
-    candidates = _git_candidate_files(repo_root)
+    candidates = _git_candidate_files(root)
     findings: list[dict[str, Any]] = []
 
     for relative_path in candidates:
-        forbidden_pattern = _matches_any(relative_path, GIT_FORBIDDEN_PATTERNS)
+        forbidden_pattern = _matches_any(
+            relative_path,
+            GIT_FORBIDDEN_PATTERNS,
+        )
 
         if forbidden_pattern:
             findings.append({
@@ -700,12 +1019,18 @@ def run_git_security_audit() -> dict[str, Any]:
                 "type": "forbidden_file",
                 "file": relative_path,
                 "line": None,
-                "message": f"Arquivo não deve ser publicado (regra: {forbidden_pattern}).",
+                "message": (
+                    "Arquivo não deve ser publicado "
+                    f"(regra: {forbidden_pattern})."
+                ),
                 "preview": "",
             })
             continue
 
-        warning_pattern = _matches_any(relative_path, GIT_WARNING_PATTERNS)
+        warning_pattern = _matches_any(
+            relative_path,
+            GIT_WARNING_PATTERNS,
+        )
 
         if warning_pattern:
             findings.append({
@@ -713,11 +1038,19 @@ def run_git_security_audit() -> dict[str, Any]:
                 "type": "review_file",
                 "file": relative_path,
                 "line": None,
-                "message": f"Revisar antes de publicar (regra: {warning_pattern}).",
+                "message": (
+                    "Revisar antes de publicar "
+                    f"(regra: {warning_pattern})."
+                ),
                 "preview": "",
             })
 
-        findings.extend(_scan_file_for_secrets(repo_root, relative_path))
+        findings.extend(
+            _scan_file_for_secrets(
+                root,
+                relative_path,
+            )
+        )
 
     blocking_count = sum(
         1 for finding in findings
@@ -728,9 +1061,16 @@ def run_git_security_audit() -> dict[str, Any]:
         if finding.get("severity") == "warning"
     )
 
-    tracked_count = len(
-        [line for line in _git_output(["ls-files"]).splitlines() if line.strip()]
+    tracked_result = _run_process(
+        ["git", "ls-files"],
+        cwd=root,
+        timeout=30,
     )
+    tracked_count = len([
+        line
+        for line in tracked_result["output"].splitlines()
+        if line.strip()
+    ]) if tracked_result["ok"] else 0
 
     return {
         "available": True,
@@ -744,68 +1084,228 @@ def run_git_security_audit() -> dict[str, Any]:
     }
 
 
-def latest_release_assets() -> dict[str, Any]:
-    """Localiza o MSIX e certificado mais recentes no diretório release."""
-    release_dir = SOURCE_DIR / "release"
+def _release_file_is_allowed(path: Path) -> bool:
+    if not path.is_file():
+        return False
 
-    msix_file: Path | None = None
-    certificate_file: Path | None = None
+    lower_name = path.name.lower()
+
+    if any(
+        lower_name.endswith(suffix)
+        for suffix in RELEASE_PRIVATE_SUFFIXES
+    ):
+        return False
+
+    return any(
+        lower_name.endswith(suffix)
+        for suffix in RELEASE_ALLOWED_SUFFIXES
+    )
+
+
+def project_release_assets(
+    repo_root: Path | None = None,
+) -> dict[str, Any]:
+    """Lista artefatos públicos disponíveis em <projeto>/release."""
+    root = repo_root or _git_repo_root()
+
+    if root is None:
+        return {
+            "directory": "",
+            "files": [],
+            "primary": "",
+            "certificate": "",
+            "suggested_tag": "",
+            "suggested_title": "",
+        }
+
+    release_dir = root / "release"
+    files: list[dict[str, Any]] = []
 
     if release_dir.is_dir():
-        msix_candidates = list(release_dir.glob("TechToolHub_*_x64.msix"))
-        if msix_candidates:
-            msix_file = max(msix_candidates, key=lambda item: item.stat().st_mtime)
+        for candidate in release_dir.rglob("*"):
+            if not _release_file_is_allowed(candidate):
+                continue
 
-        cert_candidate = release_dir / "TechToolHub.cer"
-        if cert_candidate.is_file():
-            certificate_file = cert_candidate
+            try:
+                relative = candidate.relative_to(root)
+                size = candidate.stat().st_size
+                modified = candidate.stat().st_mtime
+            except OSError:
+                continue
+
+            files.append({
+                "name": candidate.name,
+                "path": str(candidate),
+                "relative_path": str(relative).replace("\\", "/"),
+                "size": size,
+                "modified": modified,
+                "is_certificate": candidate.suffix.lower() == ".cer",
+            })
+
+    files.sort(
+        key=lambda item: (
+            bool(item.get("is_certificate")),
+            -float(item.get("modified", 0)),
+        )
+    )
+
+    primary_item = next(
+        (
+            item for item in files
+            if not item.get("is_certificate")
+        ),
+        None,
+    )
+    certificate_item = next(
+        (
+            item for item in files
+            if item.get("is_certificate")
+        ),
+        None,
+    )
 
     suggested_tag = ""
     suggested_title = ""
 
-    if msix_file:
-        match = re.search(
-            r"TechToolHub_(\d+)\.(\d+)\.(\d+)\.(\d+)_x64\.msix$",
-            msix_file.name,
-            re.IGNORECASE,
+    if primary_item:
+        version_match = re.search(
+            r"(?<!\d)(\d+\.\d+\.\d+)(?:\.\d+)?(?!\d)",
+            str(primary_item["name"]),
         )
-        if match:
-            major, minor, patch, _build = match.groups()
-            suggested_tag = f"v{major}.{minor}.{patch}"
-            suggested_title = f"TECH TOOL HUB {suggested_tag}"
+        if version_match:
+            suggested_tag = f"v{version_match.group(1)}"
+            suggested_title = (
+                f"{root.name} {suggested_tag}"
+            )
 
     return {
-        "msix": str(msix_file) if msix_file else "",
-        "certificate": str(certificate_file) if certificate_file else "",
+        "directory": str(release_dir),
+        "files": files[:60],
+        "primary": (
+            str(primary_item["path"])
+            if primary_item else ""
+        ),
+        "certificate": (
+            str(certificate_item["path"])
+            if certificate_item else ""
+        ),
         "suggested_tag": suggested_tag,
         "suggested_title": suggested_title,
     }
 
 
+def _selected_projects_public_state() -> dict[str, Any]:
+    state = _load_git_projects_state()
+    selected_path = str(state.get("selected_path", ""))
+    projects: list[dict[str, Any]] = []
+
+    for item in state.get("projects", []):
+        path = _clean_project_path(
+            str(item.get("path", ""))
+        )
+        if path is None:
+            continue
+
+        repo_root = _repo_root_from_path(path)
+
+        projects.append({
+            "name": str(item.get("name") or path.name),
+            "path": str(path),
+            "is_git": repo_root is not None,
+            "repo_root": str(repo_root) if repo_root else "",
+            "selected": (
+                str(path).lower() == selected_path.lower()
+                if os.name == "nt"
+                else str(path) == selected_path
+            ),
+        })
+
+    return {
+        "selected_path": selected_path,
+        "projects": projects,
+    }
+
+
 def git_github_environment() -> dict[str, Any]:
-    """Resumo do Git local, remoto GitHub e GitHub CLI."""
+    """Resumo do projeto selecionado, Git, origin e GitHub CLI."""
     source_available, source_reason = _is_source_git_mode()
+    selected = _selected_project_path()
     repo_root = _git_repo_root()
+    project_state = _selected_projects_public_state()
 
     branch = ""
     remote = ""
     status_lines: list[str] = []
     last_commit = ""
     upstream = ""
+    ahead = 0
+    behind = 0
 
     if repo_root:
-        branch = _git_output(["branch", "--show-current"])
-        remote = _git_output(["remote", "get-url", "origin"])
+        branch = _git_output(
+            ["branch", "--show-current"],
+            repo_root=repo_root,
+        )
+        remote = _git_output(
+            ["remote", "get-url", "origin"],
+            repo_root=repo_root,
+        )
         status_lines = [
-            line for line in _git_output(["status", "--porcelain"]).splitlines()
+            line
+            for line in _git_output(
+                ["status", "--porcelain"],
+                repo_root=repo_root,
+            ).splitlines()
             if line.strip()
         ]
         last_commit = _git_output(
-            ["log", "-1", "--format=%h|%s|%ci"]
+            ["log", "-1", "--format=%h|%s|%ci"],
+            repo_root=repo_root,
         )
         upstream = _git_output(
-            ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]
+            [
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ],
+            repo_root=repo_root,
         )
+
+        if branch:
+            remote_ref = f"origin/{branch}"
+            verify = _run_process(
+                [
+                    "git",
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    f"refs/remotes/{remote_ref}",
+                ],
+                cwd=repo_root,
+                timeout=15,
+            )
+            if verify["ok"]:
+                divergence = _run_process(
+                    [
+                        "git",
+                        "rev-list",
+                        "--left-right",
+                        "--count",
+                        f"HEAD...{remote_ref}",
+                    ],
+                    cwd=repo_root,
+                    timeout=15,
+                )
+                if divergence["ok"]:
+                    parts = divergence["output"].split()
+                    if len(parts) >= 2:
+                        try:
+                            ahead = int(parts[0])
+                            behind = int(parts[1])
+                        except ValueError:
+                            ahead = 0
+                            behind = 0
 
     gh_path = shutil.which("gh")
     gh_installed = bool(gh_path)
@@ -815,15 +1315,28 @@ def git_github_environment() -> dict[str, Any]:
     if gh_installed:
         auth_result = _run_process(
             ["gh", "auth", "status"],
-            cwd=repo_root or SOURCE_DIR,
+            cwd=repo_root or selected or SOURCE_DIR,
             timeout=30,
         )
         gh_authenticated = auth_result["ok"]
         gh_auth_message = auth_result["output"]
 
+    selected_name = ""
+    if repo_root:
+        selected_name = repo_root.name
+    elif selected:
+        selected_name = selected.name
+
     return {
         "source_mode": source_available,
         "source_reason": source_reason,
+        "selected_project": {
+            "name": selected_name,
+            "path": str(selected) if selected else "",
+            "repo_root": str(repo_root) if repo_root else "",
+            "is_git": repo_root is not None,
+        },
+        "projects": project_state["projects"],
         "repo_root": str(repo_root) if repo_root else "",
         "branch": branch,
         "remote": remote,
@@ -831,43 +1344,81 @@ def git_github_environment() -> dict[str, Any]:
         "status_lines": status_lines[:30],
         "last_commit": last_commit,
         "upstream": upstream,
+        "ahead": ahead,
+        "behind": behind,
         "git_installed": bool(shutil.which("git")),
         "gh_installed": gh_installed,
         "gh_authenticated": gh_authenticated,
         "gh_auth_message": gh_auth_message,
-        "release_assets": latest_release_assets(),
+        "release_assets": project_release_assets(repo_root),
     }
 
 
-def publish_project_to_github(commit_message: str) -> dict[str, Any]:
-    """Audita, adiciona, commita e envia a branch atual para origin."""
+def _remote_branch_exists(
+    repo_root: Path,
+    branch: str,
+) -> bool:
+    result = _run_process(
+        [
+            "git",
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/remotes/origin/{branch}",
+        ],
+        cwd=repo_root,
+        timeout=20,
+    )
+    return result["ok"]
+
+
+def publish_project_to_github(
+    commit_message: str,
+) -> dict[str, Any]:
+    """Audita, commita, sincroniza com origin e faz push."""
     environment = git_github_environment()
 
     if not environment["source_mode"]:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=environment["source_reason"] or "Git indisponível.",
+            detail=(
+                environment["source_reason"]
+                or "Git indisponível."
+            ),
         )
 
-    audit = run_git_security_audit()
+    repo_root = Path(environment["repo_root"])
+    branch = environment["branch"]
+    remote = environment["remote"]
+
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "O projeto está em HEAD destacado. "
+                "Selecione/crie uma branch antes de publicar."
+            ),
+        )
+
+    if not remote:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "O remote 'origin' não está configurado "
+                "neste projeto."
+            ),
+        )
+
+    audit = run_git_security_audit(repo_root)
 
     if audit["blocking_count"] > 0:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                f"Publicação bloqueada: {audit['blocking_count']} "
-                "risco(s) de segurança encontrado(s)."
+                f"Publicação bloqueada: "
+                f"{audit['blocking_count']} risco(s) "
+                "de segurança encontrado(s)."
             ),
-        )
-
-    repo_root = Path(environment["repo_root"])
-    branch = environment["branch"] or "main"
-    remote = environment["remote"]
-
-    if not remote:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="O remote 'origin' não está configurado.",
         )
 
     logs: list[str] = []
@@ -884,17 +1435,24 @@ def publish_project_to_github(commit_message: str) -> dict[str, Any]:
     if not add_result["ok"]:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=add_result["output"] or "git add falhou.",
+            detail=(
+                add_result["output"]
+                or "git add falhou."
+            ),
         )
 
-    # Reexecuta auditoria após staging.
-    staged_audit = run_git_security_audit()
+    staged_audit = run_git_security_audit(repo_root)
     if staged_audit["blocking_count"] > 0:
-        _run_process(["git", "reset"], cwd=repo_root, timeout=30)
+        _run_process(
+            ["git", "reset"],
+            cwd=repo_root,
+            timeout=30,
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                "O staging foi cancelado porque a auditoria encontrou "
+                "O staging foi cancelado porque a "
+                "auditoria encontrou "
                 f"{staged_audit['blocking_count']} risco(s)."
             ),
         )
@@ -908,38 +1466,160 @@ def publish_project_to_github(commit_message: str) -> dict[str, Any]:
     committed = False
     if diff_result["returncode"] == 1:
         commit_result = _run_process(
-            ["git", "commit", "-m", commit_message.strip()],
+            [
+                "git",
+                "commit",
+                "-m",
+                commit_message.strip(),
+            ],
             cwd=repo_root,
             timeout=120,
         )
-        logs.append(f"$ git commit -m {commit_message.strip()!r}")
+        logs.append(
+            f"$ git commit -m {commit_message.strip()!r}"
+        )
         if commit_result["output"]:
             logs.append(commit_result["output"])
 
         if not commit_result["ok"]:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=commit_result["output"] or "git commit falhou.",
+                detail=(
+                    commit_result["output"]
+                    or "git commit falhou."
+                ),
             )
         committed = True
 
-    push_result = _run_process(
-        ["git", "push", "origin", branch],
+    fetch_result = _run_process(
+        ["git", "fetch", "origin"],
         cwd=repo_root,
         timeout=180,
     )
-    logs.append(f"$ git push origin {branch}")
+    logs.append("$ git fetch origin")
+    if fetch_result["output"]:
+        logs.append(fetch_result["output"])
+
+    if not fetch_result["ok"]:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                fetch_result["output"]
+                or "git fetch origin falhou."
+            ),
+        )
+
+    if _remote_branch_exists(repo_root, branch):
+        divergence = _run_process(
+            [
+                "git",
+                "rev-list",
+                "--left-right",
+                "--count",
+                f"HEAD...origin/{branch}",
+            ],
+            cwd=repo_root,
+            timeout=30,
+        )
+
+        remote_ahead = 0
+        if divergence["ok"]:
+            parts = divergence["output"].split()
+            if len(parts) >= 2:
+                try:
+                    remote_ahead = int(parts[1])
+                except ValueError:
+                    remote_ahead = 0
+
+        if remote_ahead > 0:
+            rebase_result = _run_process(
+                [
+                    "git",
+                    "pull",
+                    "--rebase",
+                    "origin",
+                    branch,
+                ],
+                cwd=repo_root,
+                timeout=180,
+            )
+            logs.append(
+                f"$ git pull --rebase origin {branch}"
+            )
+            if rebase_result["output"]:
+                logs.append(rebase_result["output"])
+
+            if not rebase_result["ok"]:
+                conflicts_result = _run_process(
+                    [
+                        "git",
+                        "diff",
+                        "--name-only",
+                        "--diff-filter=U",
+                    ],
+                    cwd=repo_root,
+                    timeout=30,
+                )
+                conflict_files = [
+                    line.strip()
+                    for line in conflicts_result["output"].splitlines()
+                    if line.strip()
+                ]
+
+                _run_process(
+                    ["git", "rebase", "--abort"],
+                    cwd=repo_root,
+                    timeout=30,
+                )
+
+                detail = (
+                    "O remoto possui alterações e o rebase "
+                    "gerou conflito. O rebase foi abortado "
+                    "para preservar o projeto."
+                )
+                if conflict_files:
+                    detail += (
+                        " Arquivos em conflito: "
+                        + ", ".join(conflict_files[:12])
+                    )
+
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=detail,
+                )
+
+    push_result = _run_process(
+        [
+            "git",
+            "push",
+            "-u",
+            "origin",
+            branch,
+        ],
+        cwd=repo_root,
+        timeout=180,
+    )
+    logs.append(
+        f"$ git push -u origin {branch}"
+    )
     if push_result["output"]:
         logs.append(push_result["output"])
 
     if not push_result["ok"]:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=push_result["output"] or "git push falhou.",
+            detail=(
+                push_result["output"]
+                or "git push falhou."
+            ),
         )
 
     return {
-        "message": "Projeto enviado ao GitHub com sucesso.",
+        "message": (
+            f"Projeto {repo_root.name} enviado "
+            "ao GitHub com sucesso."
+        ),
+        "project": repo_root.name,
         "committed": committed,
         "branch": branch,
         "remote": remote,
@@ -948,14 +1628,55 @@ def publish_project_to_github(commit_message: str) -> dict[str, Any]:
     }
 
 
-def create_github_release(payload: GitReleaseRequest) -> dict[str, Any]:
-    """Cria uma GitHub Release usando gh CLI já autenticado."""
+def _validated_release_asset(
+    repo_root: Path,
+    asset_path: str,
+) -> Path | None:
+    raw = str(asset_path or "").strip()
+    if not raw:
+        return None
+
+    try:
+        candidate = Path(raw).resolve()
+        release_root = (repo_root / "release").resolve()
+        candidate.relative_to(release_root)
+    except (OSError, RuntimeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "O artefato da Release precisa estar "
+                "dentro da pasta release do projeto."
+            ),
+        )
+
+    if not _release_file_is_allowed(candidate):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="O arquivo selecionado não é um artefato de Release permitido.",
+        )
+
+    if candidate.suffix.lower() == ".cer":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Selecione um artefato principal; o .cer é anexado separadamente.",
+        )
+
+    return candidate
+
+
+def create_github_release(
+    payload: GitReleaseRequest,
+) -> dict[str, Any]:
+    """Cria Release do projeto selecionado usando gh autenticado."""
     environment = git_github_environment()
 
     if not environment["source_mode"]:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=environment["source_reason"] or "Git indisponível.",
+            detail=(
+                environment["source_reason"]
+                or "Git indisponível."
+            ),
         )
 
     if not environment["gh_installed"]:
@@ -970,33 +1691,48 @@ def create_github_release(payload: GitReleaseRequest) -> dict[str, Any]:
     if not environment["gh_authenticated"]:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="GitHub CLI não está autenticado. Execute: gh auth login",
-        )
-
-    audit = run_git_security_audit()
-    if audit["blocking_count"] > 0:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Release bloqueada até a auditoria de segurança ficar sem riscos altos.",
+            detail=(
+                "GitHub CLI não está autenticado. "
+                "Execute: gh auth login"
+            ),
         )
 
     repo_root = Path(environment["repo_root"])
-    assets = latest_release_assets()
+    audit = run_git_security_audit(repo_root)
 
-    msix_path = Path(assets["msix"]) if assets["msix"] else None
-    if not msix_path or not msix_path.is_file():
+    if audit["blocking_count"] > 0:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Nenhum MSIX foi encontrado na pasta release.",
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Release bloqueada até a auditoria "
+                "de segurança ficar sem riscos altos."
+            ),
         )
 
     tag = payload.tag.strip()
     title = payload.title.strip()
 
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", tag):
+    if not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._+-]{0,79}",
+        tag,
+    ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="A tag contém caracteres inválidos.",
+        )
+
+    duplicate_version = re.fullmatch(
+        r"(v?\d+\.\d+\.\d+(?:\.\d+)?)\1",
+        tag,
+        re.IGNORECASE,
+    )
+    if duplicate_version:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "A tag parece estar duplicada. "
+                f"Use apenas {duplicate_version.group(1)}."
+            ),
         )
 
     existing = _run_process(
@@ -1010,27 +1746,42 @@ def create_github_release(payload: GitReleaseRequest) -> dict[str, Any]:
             detail=f"A release {tag} já existe.",
         )
 
+    assets = project_release_assets(repo_root)
+    selected_asset = _validated_release_asset(
+        repo_root,
+        payload.asset_path,
+    )
+
+    if selected_asset is None and assets["primary"]:
+        selected_asset = Path(assets["primary"])
+
     command = [
         "gh",
         "release",
         "create",
         tag,
-        str(msix_path),
+    ]
+
+    if selected_asset is not None:
+        command.append(str(selected_asset))
+
+    certificate: Path | None = None
+    if payload.include_certificate and assets["certificate"]:
+        certificate = Path(assets["certificate"])
+        if certificate.is_file():
+            command.append(str(certificate))
+
+    command.extend([
         "--title",
         title,
         "--notes",
-        payload.notes.strip() or f"Release {title}",
+        (
+            payload.notes.strip()
+            or f"Release {title}"
+        ),
         "--target",
         environment["branch"] or "main",
-    ]
-
-    certificate = Path(assets["certificate"]) if assets["certificate"] else None
-    if (
-        payload.include_certificate
-        and certificate
-        and certificate.is_file()
-    ):
-        command.insert(4, str(certificate))
+    ])
 
     if payload.draft:
         command.append("--draft")
@@ -1044,7 +1795,10 @@ def create_github_release(payload: GitReleaseRequest) -> dict[str, Any]:
     if not result["ok"]:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=result["output"] or "Falha ao criar GitHub Release.",
+            detail=(
+                result["output"]
+                or "Falha ao criar GitHub Release."
+            ),
         )
 
     release_url = ""
@@ -1072,13 +1826,19 @@ def create_github_release(payload: GitReleaseRequest) -> dict[str, Any]:
 
     return {
         "message": f"Release {tag} criada com sucesso.",
+        "project": repo_root.name,
         "tag": tag,
         "title": title,
         "url": release_url,
-        "msix": str(msix_path),
+        "asset": (
+            str(selected_asset)
+            if selected_asset is not None
+            else ""
+        ),
         "certificate": (
             str(certificate)
-            if payload.include_certificate and certificate and certificate.is_file()
+            if certificate is not None
+            and certificate.is_file()
             else ""
         ),
         "draft": payload.draft,
@@ -2565,6 +3325,10 @@ class ProjectResourcesOrderRequest(BaseModel):
     resources: list[ProjectResourceRequest]
 
 
+class GitProjectPathRequest(BaseModel):
+    path: str = Field(..., min_length=1, max_length=1200)
+
+
 class GitPublishRequest(BaseModel):
     commit_message: str = Field(..., min_length=1, max_length=160)
 
@@ -2573,6 +3337,7 @@ class GitReleaseRequest(BaseModel):
     tag: str = Field(..., min_length=1, max_length=80)
     title: str = Field(..., min_length=1, max_length=140)
     notes: str = Field(default="", max_length=5000)
+    asset_path: str = Field(default="", max_length=1600)
     include_certificate: bool = True
     draft: bool = False
 
@@ -9845,6 +10610,37 @@ GIT_GITHUB_HTML = r"""
                 </p>
             </section>
 
+            <!-- SELETOR DE PROJETO -->
+            <section class="panel mb-5 rounded-2xl p-4 sm:p-5">
+                <div class="flex flex-col gap-4 xl:flex-row xl:items-end">
+                    <div class="min-w-0 flex-1">
+                        <div class="flex flex-wrap items-center gap-2">
+                            <h3 class="text-sm font-bold text-slate-200">Projeto ativo</h3>
+                            <span id="selectedProjectGitBadge" class="rounded-md border border-slate-700/25 px-2 py-0.5 text-[9px] font-bold uppercase tracking-[.08em] text-slate-500">...</span>
+                        </div>
+                        <p class="mt-1 text-[10px] leading-5 text-slate-600">
+                            Selecione qualquer repositório do computador. A checagem, commit, push e Release serão executados somente no projeto ativo.
+                        </p>
+
+                        <div class="mt-3 grid gap-2 lg:grid-cols-[minmax(0,1fr)_auto_auto]">
+                            <select id="projectSelect" class="h-11 min-w-0 rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-sm text-slate-200 outline-none focus:border-cyan-400/35">
+                                <option>Carregando projetos...</option>
+                            </select>
+
+                            <button id="chooseProjectFolderBtn" class="h-11 rounded-xl border border-cyan-400/20 bg-cyan-400/10 px-4 text-xs font-bold text-cyan-200 hover:bg-cyan-400/15">
+                                📁 Selecionar pasta
+                            </button>
+
+                            <button id="forgetProjectBtn" class="h-11 rounded-xl border border-slate-700/25 bg-[#091c29] px-4 text-xs font-bold text-slate-400 hover:text-slate-200">
+                                Remover da lista
+                            </button>
+                        </div>
+
+                        <div id="selectedProjectPath" class="mt-2 break-all text-[10px] text-slate-600">—</div>
+                    </div>
+                </div>
+            </section>
+
             <!-- STATUS -->
             <section class="panel rounded-2xl p-4 sm:p-5">
                 <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -9869,8 +10665,8 @@ GIT_GITHUB_HTML = r"""
                         <div id="ghStatus" class="mt-1 text-sm font-bold text-slate-300">—</div>
                     </div>
                     <div class="status-card rounded-xl p-3">
-                        <div class="text-[9px] font-bold uppercase tracking-[.12em] text-slate-600">MSIX mais recente</div>
-                        <div id="latestMsixName" class="mt-1 truncate text-xs font-bold text-slate-300">—</div>
+                        <div class="text-[9px] font-bold uppercase tracking-[.12em] text-slate-600">Artefato de Release</div>
+                        <div id="latestReleaseName" class="mt-1 truncate text-xs font-bold text-slate-300">—</div>
                     </div>
                 </div>
 
@@ -9921,14 +10717,14 @@ GIT_GITHUB_HTML = r"""
                         <div>
                             <div class="text-[10px] font-bold uppercase tracking-[.12em] text-cyan-400/60">Etapa 2</div>
                             <h3 class="mt-1 text-lg font-bold text-slate-100">Enviar ao GitHub</h3>
-                            <p class="mt-1 text-xs leading-5 text-slate-500">Executa auditoria, git add, commit e push da branch atual para origin.</p>
+                            <p class="mt-1 text-xs leading-5 text-slate-500">Executa auditoria, commit, fetch, rebase seguro quando necessário e push para origin.</p>
                         </div>
                         <div class="text-2xl">⑂</div>
                     </div>
 
                     <label class="mt-4 block">
                         <span class="mb-1.5 block text-[10px] font-bold uppercase tracking-[.08em] text-slate-600">Mensagem do commit</span>
-                        <input id="commitMessageInput" maxlength="160" value="Atualiza TECH TOOL HUB" class="h-11 w-full rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-sm text-slate-200 outline-none focus:border-cyan-400/35">
+                        <input id="commitMessageInput" maxlength="160" value="Atualiza projeto" class="h-11 w-full rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-sm text-slate-200 outline-none focus:border-cyan-400/35">
                     </label>
 
                     <button id="publishGitBtn" class="mt-4 h-11 w-full rounded-xl border border-emerald-400/20 bg-emerald-400/10 text-xs font-bold text-emerald-200 hover:bg-emerald-400/15 disabled:cursor-not-allowed disabled:opacity-40">
@@ -9944,7 +10740,7 @@ GIT_GITHUB_HTML = r"""
                         <div>
                             <div class="text-[10px] font-bold uppercase tracking-[.12em] text-cyan-400/60">Etapa 3</div>
                             <h3 class="mt-1 text-lg font-bold text-slate-100">Criar Release</h3>
-                            <p class="mt-1 text-xs leading-5 text-slate-500">Publica o MSIX mais recente usando o GitHub CLI autenticado.</p>
+                            <p class="mt-1 text-xs leading-5 text-slate-500">Cria uma Release do projeto ativo e pode anexar um artefato da pasta release.</p>
                         </div>
                         <div class="text-2xl">⬡</div>
                     </div>
@@ -9959,6 +10755,13 @@ GIT_GITHUB_HTML = r"""
                             <input id="releaseTitleInput" placeholder="TECH TOOL HUB v2.24.0" class="h-10 w-full rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-sm text-slate-200 outline-none focus:border-cyan-400/35">
                         </label>
                     </div>
+
+                    <label class="mt-3 block">
+                        <span class="mb-1.5 block text-[10px] font-bold uppercase tracking-[.08em] text-slate-600">Artefato da pasta release</span>
+                        <select id="releaseAssetSelect" class="h-10 w-full rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-sm text-slate-200 outline-none focus:border-cyan-400/35">
+                            <option value="">Sem artefato / detectar automaticamente</option>
+                        </select>
+                    </label>
 
                     <label class="mt-3 block">
                         <span class="mb-1.5 block text-[10px] font-bold uppercase tracking-[.08em] text-slate-600">Notas</span>
@@ -10009,10 +10812,13 @@ GIT_GITHUB_HTML = r"""
 
         const environmentMessage = document.getElementById('environmentMessage');
         const sourceModeBadge = document.getElementById('sourceModeBadge');
+        const projectSelect = document.getElementById('projectSelect');
+        const selectedProjectPath = document.getElementById('selectedProjectPath');
+        const selectedProjectGitBadge = document.getElementById('selectedProjectGitBadge');
         const gitBranch = document.getElementById('gitBranch');
         const gitChangedFiles = document.getElementById('gitChangedFiles');
         const ghStatus = document.getElementById('ghStatus');
-        const latestMsixName = document.getElementById('latestMsixName');
+        const latestReleaseName = document.getElementById('latestReleaseName');
         const gitRemote = document.getElementById('gitRemote');
 
         const auditCandidates = document.getElementById('auditCandidates');
@@ -10025,6 +10831,7 @@ GIT_GITHUB_HTML = r"""
 
         const releaseTagInput = document.getElementById('releaseTagInput');
         const releaseTitleInput = document.getElementById('releaseTitleInput');
+        const releaseAssetSelect = document.getElementById('releaseAssetSelect');
         const releaseNotesInput = document.getElementById('releaseNotesInput');
         const includeCertificateInput = document.getElementById('includeCertificateInput');
         const releaseDraftInput = document.getElementById('releaseDraftInput');
@@ -10080,7 +10887,133 @@ GIT_GITHUB_HTML = r"""
             element.classList.remove('hidden');
         }
 
-        async function loadEnvironment() {
+        function renderProjectSelector(data) {
+            const projects = Array.isArray(data.projects) ? data.projects : [];
+            const selected = data.selected_project || {};
+            const selectedPath = selected.path || '';
+
+            projectSelect.innerHTML = '';
+
+            if (!projects.length) {
+                const option = document.createElement('option');
+                option.value = '';
+                option.textContent = 'Nenhum projeto salvo';
+                projectSelect.appendChild(option);
+            } else {
+                projects.forEach(project => {
+                    const option = document.createElement('option');
+                    option.value = project.path;
+                    option.textContent = `${project.name}${project.is_git ? '' : ' — sem Git'}`;
+                    option.selected = project.path === selectedPath;
+                    projectSelect.appendChild(option);
+                });
+            }
+
+            selectedProjectPath.textContent = selectedPath || 'Nenhuma pasta selecionada';
+            selectedProjectGitBadge.textContent = selected.is_git ? 'Git pronto' : 'Sem Git';
+            selectedProjectGitBadge.className =
+                'rounded-md border px-2 py-0.5 text-[9px] font-bold uppercase tracking-[.08em] ' +
+                (selected.is_git
+                    ? 'border-emerald-400/20 bg-emerald-400/5 text-emerald-300'
+                    : 'border-amber-400/20 bg-amber-400/5 text-amber-200');
+        }
+
+        function renderReleaseAssets(assets) {
+            const files = Array.isArray(assets?.files)
+                ? assets.files.filter(item => !item.is_certificate)
+                : [];
+
+            releaseAssetSelect.innerHTML =
+                '<option value="">Sem artefato / detectar automaticamente</option>';
+
+            files.forEach(item => {
+                const option = document.createElement('option');
+                option.value = item.path;
+                option.textContent = item.relative_path || item.name;
+                option.selected = Boolean(assets.primary && item.path === assets.primary);
+                releaseAssetSelect.appendChild(option);
+            });
+
+            latestReleaseName.textContent = assets?.primary
+                ? basename(assets.primary)
+                : 'Nenhum artefato';
+        }
+
+        async function chooseProjectFolder() {
+            const button = document.getElementById('chooseProjectFolderBtn');
+            button.disabled = true;
+            button.textContent = 'Abrindo seletor...';
+
+            try {
+                const response = await fetch('/api/git-dashboard/select-folder', {
+                    method: 'POST'
+                });
+                const data = await response.json();
+
+                if (!response.ok) throw new Error(data.detail || 'Falha ao selecionar pasta.');
+
+                if (data.cancelled) {
+                    appendLog('Seleção de pasta cancelada.');
+                    return;
+                }
+
+                appendLog(
+                    `Projeto selecionado: ${data.selected_path}` +
+                    (data.is_git ? '' : '\nA pasta ainda não é um repositório Git.')
+                );
+                showToast(data.is_git ? 'Projeto Git selecionado.' : 'Pasta selecionada; Git ainda não inicializado.');
+                await loadEnvironment({ resetReleaseFields: true });
+            } catch (error) {
+                showToast(error.message || 'Erro ao selecionar pasta.', true);
+                appendLog(`ERRO seletor: ${error.message || error}`);
+            } finally {
+                button.disabled = false;
+                button.textContent = '📁 Selecionar pasta';
+            }
+        }
+
+        async function activateProject(path) {
+            if (!path) return;
+
+            try {
+                const response = await fetch('/api/git-dashboard/activate-project', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path })
+                });
+                const data = await response.json();
+
+                if (!response.ok) throw new Error(data.detail || 'Falha ao ativar projeto.');
+
+                appendLog(`Projeto ativo: ${data.selected_path}`);
+                await loadEnvironment({ resetReleaseFields: true });
+            } catch (error) {
+                showToast(error.message || 'Erro ao trocar projeto.', true);
+            }
+        }
+
+        async function forgetActiveProject() {
+            const path = projectSelect.value;
+            if (!path) return;
+
+            try {
+                const response = await fetch('/api/git-dashboard/forget-project', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path })
+                });
+                const data = await response.json();
+
+                if (!response.ok) throw new Error(data.detail || 'Falha ao remover projeto da lista.');
+
+                appendLog(`Projeto removido da lista: ${path}`);
+                await loadEnvironment({ resetReleaseFields: true });
+            } catch (error) {
+                showToast(error.message || 'Erro ao remover projeto.', true);
+            }
+        }
+
+        async function loadEnvironment(options = {}) {
             const refreshButton = document.getElementById('refreshGitStatusBtn');
             refreshButton.disabled = true;
 
@@ -10090,12 +11023,13 @@ GIT_GITHUB_HTML = r"""
                 if (!response.ok) throw new Error(data.detail || 'Falha ao consultar ambiente.');
 
                 state.environment = data;
+                renderProjectSelector(data);
 
                 gitBranch.textContent = data.branch || '—';
                 gitChangedFiles.textContent = data.changed_files ?? 0;
                 gitRemote.textContent = data.remote || 'origin não configurado';
 
-                sourceModeBadge.textContent = data.source_mode ? 'Fonte pronta' : 'Indisponível';
+                sourceModeBadge.textContent = data.source_mode ? 'Projeto pronto' : 'Indisponível';
                 sourceModeBadge.className =
                     'rounded-lg border px-2.5 py-1 text-[10px] font-bold uppercase tracking-[.08em] ' +
                     (data.source_mode
@@ -10103,22 +11037,36 @@ GIT_GITHUB_HTML = r"""
                         : 'border-amber-400/20 bg-amber-400/5 text-amber-200');
 
                 environmentMessage.textContent = data.source_mode
-                    ? `Repositório: ${data.repo_root}`
-                    : (data.source_reason || 'Modo Git indisponível.');
+                    ? `Repositório: ${data.repo_root}${data.behind ? ` • remoto +${data.behind}` : ''}${data.ahead ? ` • local +${data.ahead}` : ''}`
+                    : (data.source_reason || 'Git indisponível para o projeto selecionado.');
 
                 ghStatus.textContent = data.gh_authenticated
                     ? 'Autenticado'
                     : (data.gh_installed ? 'Login necessário' : 'Não instalado');
 
                 const assets = data.release_assets || {};
-                latestMsixName.textContent = assets.msix ? basename(assets.msix) : 'Nenhum MSIX';
+                renderReleaseAssets(assets);
 
-                if (!releaseTagInput.value && assets.suggested_tag) {
-                    releaseTagInput.value = assets.suggested_tag;
-                }
+                if (options.resetReleaseFields) {
+                    releaseTagInput.value = assets.suggested_tag || '';
+                    releaseTitleInput.value =
+                        assets.suggested_title ||
+                        (data.selected_project?.name
+                            ? `${data.selected_project.name} Release`
+                            : '');
+                    releaseNotesInput.value = '';
+                } else {
+                    if (!releaseTagInput.value && assets.suggested_tag) {
+                        releaseTagInput.value = assets.suggested_tag;
+                    }
 
-                if (!releaseTitleInput.value && assets.suggested_title) {
-                    releaseTitleInput.value = assets.suggested_title;
+                    if (!releaseTitleInput.value) {
+                        releaseTitleInput.value =
+                            assets.suggested_title ||
+                            (data.selected_project?.name
+                                ? `${data.selected_project.name} Release`
+                                : '');
+                    }
                 }
 
                 const actionsAvailable = Boolean(data.source_mode);
@@ -10127,8 +11075,7 @@ GIT_GITHUB_HTML = r"""
                 document.getElementById('publishGitBtn').disabled = !actionsAvailable;
                 document.getElementById('createReleaseBtn').disabled =
                     !actionsAvailable ||
-                    !data.gh_authenticated ||
-                    !assets.msix;
+                    !data.gh_authenticated;
 
             } catch (error) {
                 showToast(error.message || 'Erro ao carregar status.', true);
@@ -10253,6 +11200,7 @@ GIT_GITHUB_HTML = r"""
                 tag: releaseTagInput.value.trim(),
                 title: releaseTitleInput.value.trim(),
                 notes: releaseNotesInput.value.trim(),
+                asset_path: releaseAssetSelect.value,
                 include_certificate: includeCertificateInput.checked,
                 draft: releaseDraftInput.checked
             };
@@ -10302,7 +11250,10 @@ GIT_GITHUB_HTML = r"""
             }
         }
 
-        document.getElementById('refreshGitStatusBtn').addEventListener('click', loadEnvironment);
+        document.getElementById('refreshGitStatusBtn').addEventListener('click', () => loadEnvironment());
+        document.getElementById('chooseProjectFolderBtn').addEventListener('click', chooseProjectFolder);
+        document.getElementById('forgetProjectBtn').addEventListener('click', forgetActiveProject);
+        projectSelect.addEventListener('change', () => activateProject(projectSelect.value));
         document.getElementById('runSecurityAuditBtn').addEventListener('click', runSecurityAudit);
         document.getElementById('publishGitBtn').addEventListener('click', publishProject);
         document.getElementById('createReleaseBtn').addEventListener('click', createRelease);
@@ -10324,7 +11275,7 @@ GIT_GITHUB_HTML = r"""
             gitSidebarOverlay.classList.add('hidden');
         });
 
-        loadEnvironment();
+        loadEnvironment({ resetReleaseFields: true });
     </script>
 </body>
 </html>
@@ -11414,9 +12365,101 @@ def get_icon(filename: str) -> FileResponse:
     return FileResponse(icon_file)
 
 
+@app.post("/api/git-dashboard/select-folder")
+def git_dashboard_select_folder(
+    request: Request,
+) -> dict[str, Any]:
+    """Abre o seletor nativo e ativa a pasta escolhida."""
+    _local_request_only(request)
+    selected_path = _choose_project_folder()
+
+    if not selected_path:
+        return {
+            "cancelled": True,
+            "selected_path": "",
+            "repo_root": "",
+            "is_git": False,
+        }
+
+    result = _remember_git_project(
+        selected_path,
+        activate=True,
+    )
+    return {
+        "cancelled": False,
+        **result,
+    }
+
+
+@app.post("/api/git-dashboard/activate-project")
+def git_dashboard_activate_project(
+    payload: GitProjectPathRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Ativa um projeto já conhecido ou informado manualmente."""
+    _local_request_only(request)
+    return _remember_git_project(
+        payload.path,
+        activate=True,
+    )
+
+
+@app.post("/api/git-dashboard/forget-project")
+def git_dashboard_forget_project(
+    payload: GitProjectPathRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Remove um projeto da lista sem apagar qualquer arquivo."""
+    _local_request_only(request)
+
+    target = _clean_project_path(payload.path)
+    state = _load_git_projects_state()
+
+    if target is None:
+        return {
+            "removed": False,
+            "selected_path": state.get("selected_path", ""),
+        }
+
+    target_text = str(target)
+    projects = [
+        item
+        for item in state.get("projects", [])
+        if (
+            str(item.get("path", "")).lower()
+            != target_text.lower()
+            if os.name == "nt"
+            else str(item.get("path", "")) != target_text
+        )
+    ]
+
+    selected_text = str(state.get("selected_path", ""))
+    was_selected = (
+        selected_text.lower() == target_text.lower()
+        if os.name == "nt"
+        else selected_text == target_text
+    )
+
+    state["projects"] = projects
+
+    if was_selected:
+        state["selected_path"] = (
+            str(projects[0].get("path", ""))
+            if projects
+            else ""
+        )
+
+    _save_git_projects_state(state)
+
+    return {
+        "removed": True,
+        "selected_path": state.get("selected_path", ""),
+    }
+
+
 @app.get("/api/git-dashboard/status")
 def git_dashboard_status(request: Request) -> dict[str, Any]:
-    """Resumo do Git, origin, GitHub CLI e assets locais."""
+    """Resumo do projeto ativo, Git, origin, GitHub CLI e Release."""
     _local_request_only(request)
     return git_github_environment()
 

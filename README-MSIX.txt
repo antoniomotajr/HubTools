@@ -222,3 +222,37 @@ Para operar Git/GitHub:
     python app.py
 
 O modo EXE/MSIX instalado não executa publicação do repositório fonte.
+
+
+SELETOR MULTIPROJETO GIT/GITHUB - v2.24.1
+------------------------------------------
+O Pipeline local seguro não fica mais preso ao repositório HubTools.
+
+Na tela GIT & GITHUB:
+- use o select "Projeto ativo" para trocar entre projetos recentes;
+- use "Selecionar pasta" para abrir o seletor nativo do Windows;
+- a pasta escolhida fica salva em:
+  %LOCALAPPDATA%\TechToolHub\git_projects.json
+- o arquivo acima não é criado dentro do repositório.
+
+Todas as ações passam a usar o projeto ativo:
+1. checagem de vazamentos;
+2. git add / commit;
+3. git fetch;
+4. git pull --rebase quando o remoto estiver à frente;
+5. git push;
+6. criação de GitHub Release.
+
+Se o rebase gerar conflito, o Hub aborta o rebase automaticamente e
+informa os arquivos conflitantes, sem forçar push.
+
+RELEASES GENÉRICAS
+------------------
+A tela também lista artefatos existentes em:
+    <projeto>\release
+
+Tipos reconhecidos incluem MSIX, EXE, MSI, ZIP, 7Z, WHL e APPX.
+Arquivos privados como PFX, PEM e KEY nunca são oferecidos para Release.
+
+O GitHub CLI continua sendo usado com a sessão já autenticada:
+    gh auth status
