@@ -148,7 +148,7 @@ ALLOWED_ICON_TYPES = {
 app = FastAPI(
     title=APP_TITLE,
     description="Hub local para centralização e gerenciamento de ferramentas.",
-    version="2.26.0",
+    version="2.26.2",
 )
 
 
@@ -1179,11 +1179,31 @@ def run_git_security_audit(
     }
 
 
+RELEASE_INTERNAL_NAMES = {
+    "base_library.zip",
+}
+
+RELEASE_INTERNAL_DIR_NAMES = {
+    "_internal",
+    "__pycache__",
+}
+
+
 def _release_file_is_allowed(path: Path) -> bool:
+    """Aceita apenas artefatos distribuíveis, nunca arquivos internos do build."""
     if not path.is_file():
         return False
 
     lower_name = path.name.lower()
+
+    if lower_name in RELEASE_INTERNAL_NAMES:
+        return False
+
+    if any(
+        part.lower() in RELEASE_INTERNAL_DIR_NAMES
+        for part in path.parts
+    ):
+        return False
 
     if any(
         lower_name.endswith(suffix)
@@ -1195,6 +1215,46 @@ def _release_file_is_allowed(path: Path) -> bool:
         lower_name.endswith(suffix)
         for suffix in RELEASE_ALLOWED_SUFFIXES
     )
+
+
+def _release_asset_priority(
+    item: dict[str, Any],
+) -> tuple[int, float, str]:
+    """
+    Prioridade de seleção automática:
+    0 = TechToolHub.exe / executável principal em release/exe
+    1 = outros .exe
+    2 = instaladores MSIX/MSI/AppX
+    3 = pacotes ZIP/7z/whl
+    9 = certificado
+    """
+    if item.get("is_certificate"):
+        return (9, 0.0, str(item.get("name", "")).casefold())
+
+    name = str(item.get("name", "")).casefold()
+    relative = str(item.get("relative_path", "")).replace("\\", "/").casefold()
+    suffix = Path(name).suffix.casefold()
+    modified = float(item.get("modified", 0) or 0)
+
+    if name == "techtoolhub.exe":
+        return (0, -modified, name)
+
+    if suffix == ".exe" and "/release/exe/" in f"/{relative}":
+        return (0, -modified, name)
+
+    if suffix == ".exe":
+        return (1, -modified, name)
+
+    if suffix in {
+        ".msix",
+        ".msixbundle",
+        ".msi",
+        ".appx",
+        ".appxbundle",
+    }:
+        return (2, -modified, name)
+
+    return (3, -modified, name)
 
 
 def project_release_assets(
@@ -1211,6 +1271,7 @@ def project_release_assets(
             "certificate": "",
             "suggested_tag": "",
             "suggested_title": "",
+            "expected_executable": "",
         }
 
     release_dir = root / "release"
@@ -1237,12 +1298,7 @@ def project_release_assets(
                 "is_certificate": candidate.suffix.lower() == ".cer",
             })
 
-    files.sort(
-        key=lambda item: (
-            bool(item.get("is_certificate")),
-            -float(item.get("modified", 0)),
-        )
-    )
+    files.sort(key=_release_asset_priority)
 
     primary_item = next(
         (
@@ -1286,6 +1342,13 @@ def project_release_assets(
         ),
         "suggested_tag": suggested_tag,
         "suggested_title": suggested_title,
+        "expected_executable": (
+            str(root / "release" / "exe" / "TechToolHub" / "TechToolHub.exe")
+            if (
+                root / "release" / "exe" / "TechToolHub" / "TechToolHub.exe"
+            ).is_file()
+            else ""
+        ),
     }
 
 
@@ -6454,12 +6517,6 @@ INDEX_HTML = r'''
                 </div>
 
                 <div class="flex flex-wrap items-center justify-end gap-2 text-xs text-slate-500">
-                    <button id="createExecutableBtn" type="button" class="inline-flex h-9 items-center gap-2 rounded-lg border border-cyan-400/20 bg-cyan-400/10 px-3 font-bold text-cyan-200 transition hover:bg-cyan-400/15">
-                        <span>⚙</span><span>Criar Executável</span>
-                    </button>
-                    <button id="showReadmeBtn" type="button" class="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-700/30 bg-[#091c29] px-3 font-semibold text-slate-300 transition hover:border-cyan-400/20 hover:text-cyan-200">
-                        <span>▤</span><span>Readme</span>
-                    </button>
                     <span class="inline-flex items-center gap-1.5 rounded-lg border border-slate-700/25 bg-[#091c29] px-3 py-2">
                         <span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>
                         API online
@@ -7430,8 +7487,8 @@ INDEX_HTML = r'''
         });
 
         // Eventos gerais
-        createExecutableBtn.addEventListener('click', openBuildExecutableModal);
-        showReadmeBtn.addEventListener('click', openReadmeModal);
+        createExecutableBtn?.addEventListener('click', openBuildExecutableModal);
+        showReadmeBtn?.addEventListener('click', openReadmeModal);
 
         document.getElementById('closeBuildExecutableModalBtn').addEventListener('click', closeBuildExecutableModal);
         document.getElementById('cancelBuildModalBtn').addEventListener('click', closeBuildExecutableModal);
@@ -12771,9 +12828,17 @@ GIT_GITHUB_HTML = r"""
                     <p class="mt-0.5 text-[10px] uppercase tracking-[.17em] text-slate-600">Segurança • Commit • Push • Release</p>
                 </div>
 
-                <button id="refreshGitStatusBtn" class="h-10 rounded-xl border border-slate-700/30 bg-[#091c29] px-4 text-xs font-bold text-slate-300 hover:border-cyan-400/25 hover:text-cyan-200">
-                    ↻ Atualizar status
-                </button>
+                <div class="flex flex-wrap items-center gap-2">
+                    <button id="gitCreateExecutableBtn" type="button" class="h-10 rounded-xl border border-cyan-400/20 bg-cyan-400/10 px-4 text-xs font-bold text-cyan-200 hover:bg-cyan-400/15">
+                        ⚙ Criar Executável
+                    </button>
+                    <button id="gitShowReadmeBtn" type="button" class="h-10 rounded-xl border border-slate-700/30 bg-[#091c29] px-4 text-xs font-bold text-slate-300 hover:border-cyan-400/25 hover:text-cyan-200">
+                        ▤ Readme
+                    </button>
+                    <button id="refreshGitStatusBtn" class="h-10 rounded-xl border border-slate-700/30 bg-[#091c29] px-4 text-xs font-bold text-slate-300 hover:border-cyan-400/25 hover:text-cyan-200">
+                        ↻ Atualizar status
+                    </button>
+                </div>
             </div>
         </header>
 
@@ -13001,6 +13066,9 @@ GIT_GITHUB_HTML = r"""
                         <select id="releaseAssetSelect" class="h-10 w-full rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-sm text-slate-200 outline-none focus:border-cyan-400/35">
                             <option value="">Sem artefato / detectar automaticamente</option>
                         </select>
+                        <p class="mt-1 text-[9px] leading-4 text-slate-600">
+                            O painel prioriza o executável principal e ignora arquivos internos do PyInstaller, como base_library.zip e _internal.
+                        </p>
                     </label>
 
                     <label class="mt-3 block">
@@ -13277,6 +13345,81 @@ GIT_GITHUB_HTML = r"""
     </div>
 
 
+
+    <!-- MODAL CRIAR EXECUTÁVEL - GIT & GITHUB -->
+    <div id="gitBuildExecutableModal" class="modal-shell fixed inset-0 z-[90] hidden items-center justify-center p-4" role="dialog" aria-modal="true">
+        <div class="panel max-h-[92vh] w-full max-w-3xl overflow-y-auto rounded-2xl shadow-2xl">
+            <div class="flex items-start justify-between gap-4 border-b border-slate-700/20 px-5 py-4">
+                <div>
+                    <div class="text-[10px] font-bold uppercase tracking-[.12em] text-cyan-400/60">Build local</div>
+                    <h3 class="mt-1 text-lg font-bold text-slate-100">Criar Executável</h3>
+                    <p class="mt-1 text-xs text-slate-500">Gera TechToolHub.exe com PyInstaller e acompanha o processo em tempo real.</p>
+                </div>
+                <button id="gitCloseBuildExecutableModalBtn" type="button" class="rounded-lg p-2 text-slate-500 hover:bg-slate-800/40 hover:text-slate-200">✕</button>
+            </div>
+
+            <div class="space-y-4 p-5">
+                <div id="gitBuildEnvironmentBox" class="rounded-xl border border-slate-700/25 bg-[#061722] p-4 text-xs text-slate-500">
+                    Verificando ambiente...
+                </div>
+
+                <div class="grid gap-3 sm:grid-cols-3">
+                    <div class="status-card rounded-xl p-3">
+                        <div class="text-[9px] font-bold uppercase tracking-[.12em] text-slate-600">Status</div>
+                        <div id="gitBuildStatusLabel" class="mt-1 text-sm font-bold text-slate-300">Pronto</div>
+                    </div>
+                    <div class="status-card rounded-xl p-3 sm:col-span-2">
+                        <div class="text-[9px] font-bold uppercase tracking-[.12em] text-slate-600">Saída</div>
+                        <div id="gitBuildOutputPath" class="mt-1 truncate text-xs font-semibold text-slate-400">—</div>
+                    </div>
+                </div>
+
+                <div>
+                    <div class="mb-2 flex items-center justify-between gap-3">
+                        <span class="text-xs font-bold text-slate-300">Log do build</span>
+                        <span id="gitBuildRunningBadge" class="hidden rounded-md border border-cyan-400/15 bg-cyan-400/5 px-2 py-1 text-[9px] font-bold uppercase tracking-[.08em] text-cyan-300">
+                            Processando
+                        </span>
+                    </div>
+                    <pre id="gitBuildLog" class="log-box max-h-[320px] min-h-[170px] overflow-auto whitespace-pre-wrap rounded-xl p-4 text-[11px] leading-5 text-slate-500">Aguardando início do build...</pre>
+                </div>
+
+                <div id="gitBuildError" class="hidden rounded-lg border border-red-900/50 bg-red-950/30 px-4 py-3 text-xs text-red-300"></div>
+
+                <div class="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
+                    <button id="gitOpenBuildFolderBtn" type="button" disabled class="h-10 rounded-lg border border-slate-700/35 px-4 text-xs font-semibold text-slate-400 disabled:cursor-not-allowed disabled:opacity-35">
+                        Abrir pasta de saída
+                    </button>
+                    <div class="flex flex-col-reverse gap-2 sm:flex-row">
+                        <button id="gitCancelBuildModalBtn" type="button" class="h-10 rounded-lg border border-slate-700/35 px-4 text-xs font-semibold text-slate-400">
+                            Fechar
+                        </button>
+                        <button id="gitRunExecutableBuildBtn" type="button" class="h-10 rounded-lg border border-cyan-300/20 bg-cyan-400/10 px-5 text-xs font-bold text-cyan-200 disabled:cursor-not-allowed disabled:opacity-40">
+                            Gerar EXE
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL README - GIT & GITHUB -->
+    <div id="gitReadmeModal" class="modal-shell fixed inset-0 z-[90] hidden items-center justify-center p-4" role="dialog" aria-modal="true">
+        <div class="panel max-h-[92vh] w-full max-w-4xl overflow-y-auto rounded-2xl shadow-2xl">
+            <div class="flex items-start justify-between gap-4 border-b border-slate-700/20 px-5 py-4">
+                <div>
+                    <div class="text-[10px] font-bold uppercase tracking-[.12em] text-cyan-400/60">Documentação</div>
+                    <h3 class="mt-1 text-lg font-bold text-slate-100">README — TECH TOOL HUB</h3>
+                    <p class="mt-1 text-xs text-slate-500">Execução, dados, build do EXE e empacotamento MSIX.</p>
+                </div>
+                <button id="gitCloseReadmeModalBtn" type="button" class="rounded-lg p-2 text-slate-500 hover:bg-slate-800/40 hover:text-slate-200">✕</button>
+            </div>
+            <div class="p-5">
+                <pre id="gitReadmeContent" class="log-box max-h-[70vh] overflow-auto whitespace-pre-wrap rounded-xl p-4 text-xs leading-6 text-slate-400">Carregando README...</pre>
+            </div>
+        </div>
+    </div>
+
     <div id="gitToast" class="pointer-events-none fixed bottom-5 right-5 z-[70] hidden max-w-sm rounded-xl border px-4 py-3 text-sm shadow-2xl"></div>
 
     <script>
@@ -13321,6 +13464,25 @@ GIT_GITHUB_HTML = r"""
         const gitToast = document.getElementById('gitToast');
 
 
+        const gitCreateExecutableBtn = document.getElementById('gitCreateExecutableBtn');
+        const gitShowReadmeBtn = document.getElementById('gitShowReadmeBtn');
+
+        const gitBuildExecutableModal = document.getElementById('gitBuildExecutableModal');
+        const gitBuildEnvironmentBox = document.getElementById('gitBuildEnvironmentBox');
+        const gitBuildStatusLabel = document.getElementById('gitBuildStatusLabel');
+        const gitBuildOutputPath = document.getElementById('gitBuildOutputPath');
+        const gitBuildLog = document.getElementById('gitBuildLog');
+        const gitBuildRunningBadge = document.getElementById('gitBuildRunningBadge');
+        const gitBuildError = document.getElementById('gitBuildError');
+        const gitRunExecutableBuildBtn = document.getElementById('gitRunExecutableBuildBtn');
+        const gitOpenBuildFolderBtn = document.getElementById('gitOpenBuildFolderBtn');
+
+        const gitReadmeModal = document.getElementById('gitReadmeModal');
+        const gitReadmeContent = document.getElementById('gitReadmeContent');
+
+        let gitBuildPollTimer = null;
+
+
         const githubRepoGrid = document.getElementById('githubRepoGrid');
         const githubReposLoading = document.getElementById('githubReposLoading');
         const githubReposError = document.getElementById('githubReposError');
@@ -13361,6 +13523,214 @@ GIT_GITHUB_HTML = r"""
             const current = gitActionLog.textContent === 'Pronto.' ? '' : gitActionLog.textContent;
             gitActionLog.textContent = `${current}${current ? '\n\n' : ''}[${stamp}] ${message}`;
             gitActionLog.scrollTop = gitActionLog.scrollHeight;
+        }
+
+
+        function setGitUtilityModalVisible(modal, visible) {
+            if (!modal) return;
+            modal.classList.toggle('hidden', !visible);
+            modal.classList.toggle('flex', visible);
+        }
+
+        function gitBuildStatusText(status) {
+            if (status === 'starting') return 'Preparando...';
+            if (status === 'running') return 'Gerando...';
+            if (status === 'success') return 'Concluído';
+            if (status === 'error') return 'Falhou';
+            return 'Pronto';
+        }
+
+        function stopGitBuildPolling() {
+            if (!gitBuildPollTimer) return;
+            clearInterval(gitBuildPollTimer);
+            gitBuildPollTimer = null;
+        }
+
+        function startGitBuildPolling() {
+            if (gitBuildPollTimer) return;
+            gitBuildPollTimer = setInterval(refreshGitBuildStatus, 1000);
+        }
+
+        function renderGitBuildState(data) {
+            const environment = data.environment || {};
+            const reasons = Array.isArray(environment.reasons)
+                ? environment.reasons
+                : [];
+
+            gitBuildEnvironmentBox.innerHTML = environment.available
+                ? `<div class="flex items-start gap-3">
+                       <span class="mt-1 h-2 w-2 shrink-0 rounded-full bg-emerald-400"></span>
+                       <div>
+                           <div class="font-semibold text-emerald-300">Ambiente pronto para gerar o EXE.</div>
+                           <div class="mt-1 text-[10px] text-slate-600">Build local do TECH TOOL HUB.</div>
+                       </div>
+                   </div>`
+                : `<div class="flex items-start gap-3">
+                       <span class="mt-1 h-2 w-2 shrink-0 rounded-full bg-amber-300"></span>
+                       <div>
+                           <div class="font-semibold text-amber-200">Build indisponível neste modo.</div>
+                           <div class="mt-1 space-y-1 text-[10px] text-slate-600">
+                               ${reasons.map(reason => `<div>• ${escapeHtml(reason)}</div>`).join('')}
+                           </div>
+                       </div>
+                   </div>`;
+
+            gitBuildStatusLabel.textContent = gitBuildStatusText(data.status);
+            gitBuildOutputPath.textContent =
+                data.output_path
+                || environment.output_dir
+                || '—';
+
+            gitBuildLog.textContent =
+                (data.log || []).join('\n')
+                || data.message
+                || 'Aguardando início do build...';
+
+            const running = Boolean(data.running);
+            gitBuildRunningBadge.classList.toggle('hidden', !running);
+            gitRunExecutableBuildBtn.disabled =
+                running || !environment.available;
+            gitRunExecutableBuildBtn.textContent =
+                running ? 'Gerando...' : 'Gerar EXE';
+            gitOpenBuildFolderBtn.disabled =
+                data.status !== 'success';
+
+            if (data.status === 'error') {
+                gitBuildError.textContent =
+                    data.message || 'O build falhou.';
+                gitBuildError.classList.remove('hidden');
+            } else {
+                gitBuildError.classList.add('hidden');
+                gitBuildError.textContent = '';
+            }
+
+            if (running) startGitBuildPolling();
+            else stopGitBuildPolling();
+        }
+
+        async function refreshGitBuildStatus() {
+            try {
+                const response = await fetch(
+                    '/api/build/status',
+                    { cache: 'no-store' }
+                );
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(
+                        data.detail
+                        || 'Não foi possível consultar o build.'
+                    );
+                }
+
+                renderGitBuildState(data);
+            } catch (error) {
+                gitBuildError.textContent =
+                    error.message
+                    || 'Erro ao consultar o build.';
+                gitBuildError.classList.remove('hidden');
+            }
+        }
+
+        async function openGitBuildExecutableModal() {
+            setGitUtilityModalVisible(
+                gitBuildExecutableModal,
+                true
+            );
+            await refreshGitBuildStatus();
+        }
+
+        function closeGitBuildExecutableModal() {
+            setGitUtilityModalVisible(
+                gitBuildExecutableModal,
+                false
+            );
+            stopGitBuildPolling();
+        }
+
+        async function runGitExecutableBuild() {
+            gitRunExecutableBuildBtn.disabled = true;
+            gitBuildError.classList.add('hidden');
+
+            try {
+                const response = await fetch(
+                    '/api/build/executable',
+                    { method: 'POST' }
+                );
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(
+                        data.detail
+                        || 'Não foi possível iniciar o build.'
+                    );
+                }
+
+                renderGitBuildState(data);
+                startGitBuildPolling();
+                appendLog('Build do executável iniciado.');
+            } catch (error) {
+                gitBuildError.textContent =
+                    error.message
+                    || 'Erro ao iniciar o build.';
+                gitBuildError.classList.remove('hidden');
+                await refreshGitBuildStatus();
+            }
+        }
+
+        async function openGitBuildOutputFolder() {
+            try {
+                const response = await fetch(
+                    '/api/build/open-output',
+                    { method: 'POST' }
+                );
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(
+                        data.detail
+                        || 'Não foi possível abrir a pasta.'
+                    );
+                }
+
+                showToast(data.message || 'Pasta aberta.');
+            } catch (error) {
+                showToast(
+                    error.message || 'Erro ao abrir a pasta.',
+                    true
+                );
+            }
+        }
+
+        async function openGitReadmeModal() {
+            setGitUtilityModalVisible(gitReadmeModal, true);
+            gitReadmeContent.textContent =
+                'Carregando README...';
+
+            try {
+                const response = await fetch(
+                    '/api/readme',
+                    { cache: 'no-store' }
+                );
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(
+                        data.detail
+                        || 'Não foi possível carregar o README.'
+                    );
+                }
+
+                gitReadmeContent.textContent =
+                    data.content || 'README vazio.';
+            } catch (error) {
+                gitReadmeContent.textContent =
+                    `Erro ao carregar README:\n${error.message || error}`;
+            }
+        }
+
+        function closeGitReadmeModal() {
+            setGitUtilityModalVisible(gitReadmeModal, false);
         }
 
         function resultBox(element, message, error = false, link = '') {
@@ -13419,8 +13789,19 @@ GIT_GITHUB_HTML = r"""
             files.forEach(item => {
                 const option = document.createElement('option');
                 option.value = item.path;
-                option.textContent = item.relative_path || item.name;
-                option.selected = Boolean(assets.primary && item.path === assets.primary);
+
+                const relativePath = item.relative_path || item.name;
+                const isExe = String(item.name || '').toLowerCase().endsWith('.exe');
+
+                option.textContent = isExe
+                    ? `EXE • ${relativePath}`
+                    : relativePath;
+
+                option.selected = Boolean(
+                    assets.primary
+                    && item.path === assets.primary
+                );
+
                 releaseAssetSelect.appendChild(option);
             });
 
@@ -14560,6 +14941,54 @@ GIT_GITHUB_HTML = r"""
             modal.addEventListener('click', event => {
                 if (event.target === modal) closeModal(id);
             });
+        });
+
+        gitCreateExecutableBtn.addEventListener(
+            'click',
+            openGitBuildExecutableModal
+        );
+        gitShowReadmeBtn.addEventListener(
+            'click',
+            openGitReadmeModal
+        );
+
+        document.getElementById('gitCloseBuildExecutableModalBtn').addEventListener(
+            'click',
+            closeGitBuildExecutableModal
+        );
+        document.getElementById('gitCancelBuildModalBtn').addEventListener(
+            'click',
+            closeGitBuildExecutableModal
+        );
+        gitRunExecutableBuildBtn.addEventListener(
+            'click',
+            runGitExecutableBuild
+        );
+        gitOpenBuildFolderBtn.addEventListener(
+            'click',
+            openGitBuildOutputFolder
+        );
+
+        gitBuildExecutableModal.addEventListener('click', event => {
+            if (event.target === gitBuildExecutableModal) {
+                closeGitBuildExecutableModal();
+            }
+        });
+
+        document.getElementById('gitCloseReadmeModalBtn').addEventListener(
+            'click',
+            closeGitReadmeModal
+        );
+        gitReadmeModal.addEventListener('click', event => {
+            if (event.target === gitReadmeModal) {
+                closeGitReadmeModal();
+            }
+        });
+
+        document.addEventListener('keydown', event => {
+            if (event.key !== 'Escape') return;
+            closeGitBuildExecutableModal();
+            closeGitReadmeModal();
         });
 
         document.getElementById('refreshGitStatusBtn').addEventListener('click', () => loadEnvironment());

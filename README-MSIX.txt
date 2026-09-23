@@ -409,3 +409,43 @@ Privacidade:
 - caminhos Git selecionados ficam somente na memória da sessão.
 
 Versão MSIX: 2.26.0.0
+
+
+REORGANIZAÇÃO GIT & GITHUB - v2.26.1
+--------------------------------------
+Os controles de manutenção:
+- Criar Executável
+- Readme
+
+foram removidos do cabeçalho do Dashboard principal e transferidos para
+a página GIT & GITHUB, ao lado de "Atualizar status".
+
+As APIs e o comportamento do build/README foram preservados.
+
+Versão MSIX:
+    2.26.1.0
+
+
+CORREÇÃO DE ARTEFATO DA RELEASE - v2.26.2
+------------------------------------------
+Problema corrigido:
+o painel de Release varria recursivamente a pasta release e podia
+selecionar base_library.zip, um componente interno do PyInstaller,
+como artefato principal.
+
+Agora:
+- base_library.zip nunca é considerado artefato publicável;
+- arquivos dentro de _internal são ignorados;
+- TechToolHub.exe é priorizado automaticamente;
+- para o TECH TOOL HUB, o executável esperado é:
+  release\exe\TechToolHub\TechToolHub.exe
+- a lista de artefatos marca executáveis com "EXE •".
+
+Observação:
+o build atual do botão "Criar Executável" usa PyInstaller --onedir.
+Portanto TechToolHub.exe pertence ao conjunto de arquivos da pasta
+release\exe\TechToolHub. Para distribuição portátil em outra máquina,
+a pasta inteira deve acompanhar o executável ou ser empacotada em ZIP.
+
+Versão MSIX:
+    2.26.2.0

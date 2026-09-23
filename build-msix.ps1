@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$PackageVersion = "2.26.0.0",
+    [string]$PackageVersion = "2.26.2.0",
     [string]$Publisher = "CN=TechToolHub",
     [string]$Python = "python",
     [switch]$Install,
