@@ -20,7 +20,9 @@ Swagger / documentação da API:
 
 from __future__ import annotations
 
+import fnmatch
 import json
+import re
 import os
 import shutil
 import sqlite3
@@ -126,7 +128,7 @@ ALLOWED_ICON_TYPES = {
 app = FastAPI(
     title=APP_TITLE,
     description="Hub local para centralização e gerenciamento de ferramentas.",
-    version="2.23.5",
+    version="2.24.0",
 )
 
 
@@ -410,6 +412,678 @@ WINDOWS_DIAGNOSTIC_BROWSERS: dict[str, dict[str, Any]] = {
         "cleanup_url": "about:preferences#privacy",
     },
 }
+
+
+
+GIT_FORBIDDEN_PATTERNS = [
+    ".env",
+    ".env.*",
+    "*.pfx",
+    "*.p12",
+    "*.pem",
+    "*.key",
+    "*.ppk",
+    "apps_data.json",
+    "links_data.json",
+    "projects_data.json",
+    "local_apps_data.json",
+    "user_profile.json",
+    "user_media/*",
+    "icons/*",
+    "release/*",
+    "build/*",
+    "dist/*",
+    "build-msix/*",
+    "build-dashboard/*",
+    "*.exe",
+    "*.msix",
+    "*.msixbundle",
+    "*.appx",
+    "*.appxbundle",
+    ".apps_catalog_v1_done",
+    ".official_icons_v1_done",
+]
+
+GIT_WARNING_PATTERNS = [
+    "*.cer",
+    "*.log",
+    "*.bak",
+    "*.tmp",
+    "*.spec",
+]
+
+SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    (
+        "private_key",
+        re.compile(
+            r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "github_token",
+        re.compile(
+            r"\b(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"
+        ),
+    ),
+    (
+        "api_secret_assignment",
+        re.compile(
+            r"""(?ix)
+            \b(
+                api[_-]?key|
+                client[_-]?secret|
+                access[_-]?token|
+                refresh[_-]?token|
+                password|
+                senha
+            )\b
+            \s*[:=]\s*
+            ["'][^"']{8,}["']
+            """
+        ),
+    ),
+]
+
+SECURITY_TEXT_EXTENSIONS = {
+    ".py", ".ps1", ".js", ".ts", ".json", ".yml", ".yaml",
+    ".toml", ".ini", ".cfg", ".conf", ".txt", ".md", ".html",
+    ".css", ".xml", ".env",
+}
+
+SECURITY_SCAN_SKIP_NAMES = {
+    "git-security-check.ps1",
+    "GIT-SECURITY-AUDIT.md",
+}
+
+
+def _run_process(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: int = 60,
+) -> dict[str, Any]:
+    """Executa um comando local sem shell e captura saída."""
+    try:
+        completed = subprocess.run(
+            args,
+            cwd=str(cwd or SOURCE_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            shell=False,
+        )
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "returncode": 127,
+            "output": f"Comando não encontrado: {args[0]}",
+        }
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ""
+        return {
+            "ok": False,
+            "returncode": 124,
+            "output": f"{output}\nTempo limite excedido.".strip(),
+        }
+
+    return {
+        "ok": completed.returncode == 0,
+        "returncode": completed.returncode,
+        "output": completed.stdout.strip(),
+    }
+
+
+def _git_repo_root() -> Path | None:
+    if not shutil.which("git"):
+        return None
+
+    result = _run_process(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=SOURCE_DIR,
+        timeout=15,
+    )
+    if not result["ok"] or not result["output"]:
+        return None
+
+    try:
+        return Path(result["output"].splitlines()[-1]).resolve()
+    except OSError:
+        return None
+
+
+def _is_source_git_mode() -> tuple[bool, str]:
+    if bool(getattr(sys, "frozen", False)):
+        return (
+            False,
+            "As funções Git/GitHub precisam ser executadas na pasta fonte com 'python app.py'.",
+        )
+
+    if not shutil.which("git"):
+        return False, "Git não foi encontrado no PATH."
+
+    repo_root = _git_repo_root()
+    if repo_root is None:
+        return False, "A pasta atual não pertence a um repositório Git."
+
+    return True, ""
+
+
+def _git_output(args: list[str], timeout: int = 30) -> str:
+    repo_root = _git_repo_root()
+    if repo_root is None:
+        return ""
+
+    result = _run_process(["git", *args], cwd=repo_root, timeout=timeout)
+    return result["output"] if result["ok"] else ""
+
+
+def _matches_any(path: str, patterns: list[str]) -> str | None:
+    normalized = path.replace("\\", "/")
+    basename = Path(normalized).name
+
+    for pattern in patterns:
+        normalized_pattern = pattern.replace("\\", "/")
+
+        if "/" in normalized_pattern:
+            if fnmatch.fnmatch(normalized, normalized_pattern):
+                return pattern
+        else:
+            if (
+                fnmatch.fnmatch(basename, normalized_pattern)
+                or fnmatch.fnmatch(normalized, normalized_pattern)
+            ):
+                return pattern
+
+    return None
+
+
+def _git_candidate_files(repo_root: Path) -> list[str]:
+    result = _run_process(
+        [
+            "git",
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+        cwd=repo_root,
+        timeout=30,
+    )
+    if not result["ok"]:
+        return []
+
+    return sorted({
+        line.strip().replace("\\", "/")
+        for line in result["output"].splitlines()
+        if line.strip()
+    })
+
+
+def _scan_file_for_secrets(repo_root: Path, relative_path: str) -> list[dict[str, Any]]:
+    path = (repo_root / relative_path).resolve()
+
+    try:
+        path.relative_to(repo_root)
+    except ValueError:
+        return []
+
+    if not path.is_file():
+        return []
+
+    if path.name in SECURITY_SCAN_SKIP_NAMES:
+        return []
+
+    if path.suffix.lower() not in SECURITY_TEXT_EXTENSIONS and not path.name.startswith(".env"):
+        return []
+
+    try:
+        if path.stat().st_size > 2 * 1024 * 1024:
+            return []
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+
+    findings: list[dict[str, Any]] = []
+
+    for line_number, line in enumerate(content.splitlines(), start=1):
+        for finding_type, pattern in SECRET_PATTERNS:
+            if not pattern.search(line):
+                continue
+
+            preview = line.strip()
+            if len(preview) > 180:
+                preview = preview[:177] + "..."
+
+            findings.append({
+                "severity": "high",
+                "type": finding_type,
+                "file": relative_path,
+                "line": line_number,
+                "message": "Possível segredo/credencial encontrado no conteúdo.",
+                "preview": preview,
+            })
+
+    return findings
+
+
+def run_git_security_audit() -> dict[str, Any]:
+    """Audita candidatos que poderiam entrar no próximo commit."""
+    available, reason = _is_source_git_mode()
+
+    if not available:
+        return {
+            "available": False,
+            "reason": reason,
+            "safe": False,
+            "blocking_count": 0,
+            "warning_count": 0,
+            "findings": [],
+            "candidate_count": 0,
+        }
+
+    repo_root = _git_repo_root()
+    assert repo_root is not None
+
+    candidates = _git_candidate_files(repo_root)
+    findings: list[dict[str, Any]] = []
+
+    for relative_path in candidates:
+        forbidden_pattern = _matches_any(relative_path, GIT_FORBIDDEN_PATTERNS)
+
+        if forbidden_pattern:
+            findings.append({
+                "severity": "high",
+                "type": "forbidden_file",
+                "file": relative_path,
+                "line": None,
+                "message": f"Arquivo não deve ser publicado (regra: {forbidden_pattern}).",
+                "preview": "",
+            })
+            continue
+
+        warning_pattern = _matches_any(relative_path, GIT_WARNING_PATTERNS)
+
+        if warning_pattern:
+            findings.append({
+                "severity": "warning",
+                "type": "review_file",
+                "file": relative_path,
+                "line": None,
+                "message": f"Revisar antes de publicar (regra: {warning_pattern}).",
+                "preview": "",
+            })
+
+        findings.extend(_scan_file_for_secrets(repo_root, relative_path))
+
+    blocking_count = sum(
+        1 for finding in findings
+        if finding.get("severity") == "high"
+    )
+    warning_count = sum(
+        1 for finding in findings
+        if finding.get("severity") == "warning"
+    )
+
+    tracked_count = len(
+        [line for line in _git_output(["ls-files"]).splitlines() if line.strip()]
+    )
+
+    return {
+        "available": True,
+        "reason": "",
+        "safe": blocking_count == 0,
+        "blocking_count": blocking_count,
+        "warning_count": warning_count,
+        "candidate_count": len(candidates),
+        "tracked_count": tracked_count,
+        "findings": findings[:100],
+    }
+
+
+def latest_release_assets() -> dict[str, Any]:
+    """Localiza o MSIX e certificado mais recentes no diretório release."""
+    release_dir = SOURCE_DIR / "release"
+
+    msix_file: Path | None = None
+    certificate_file: Path | None = None
+
+    if release_dir.is_dir():
+        msix_candidates = list(release_dir.glob("TechToolHub_*_x64.msix"))
+        if msix_candidates:
+            msix_file = max(msix_candidates, key=lambda item: item.stat().st_mtime)
+
+        cert_candidate = release_dir / "TechToolHub.cer"
+        if cert_candidate.is_file():
+            certificate_file = cert_candidate
+
+    suggested_tag = ""
+    suggested_title = ""
+
+    if msix_file:
+        match = re.search(
+            r"TechToolHub_(\d+)\.(\d+)\.(\d+)\.(\d+)_x64\.msix$",
+            msix_file.name,
+            re.IGNORECASE,
+        )
+        if match:
+            major, minor, patch, _build = match.groups()
+            suggested_tag = f"v{major}.{minor}.{patch}"
+            suggested_title = f"TECH TOOL HUB {suggested_tag}"
+
+    return {
+        "msix": str(msix_file) if msix_file else "",
+        "certificate": str(certificate_file) if certificate_file else "",
+        "suggested_tag": suggested_tag,
+        "suggested_title": suggested_title,
+    }
+
+
+def git_github_environment() -> dict[str, Any]:
+    """Resumo do Git local, remoto GitHub e GitHub CLI."""
+    source_available, source_reason = _is_source_git_mode()
+    repo_root = _git_repo_root()
+
+    branch = ""
+    remote = ""
+    status_lines: list[str] = []
+    last_commit = ""
+    upstream = ""
+
+    if repo_root:
+        branch = _git_output(["branch", "--show-current"])
+        remote = _git_output(["remote", "get-url", "origin"])
+        status_lines = [
+            line for line in _git_output(["status", "--porcelain"]).splitlines()
+            if line.strip()
+        ]
+        last_commit = _git_output(
+            ["log", "-1", "--format=%h|%s|%ci"]
+        )
+        upstream = _git_output(
+            ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]
+        )
+
+    gh_path = shutil.which("gh")
+    gh_installed = bool(gh_path)
+    gh_authenticated = False
+    gh_auth_message = "GitHub CLI não encontrado."
+
+    if gh_installed:
+        auth_result = _run_process(
+            ["gh", "auth", "status"],
+            cwd=repo_root or SOURCE_DIR,
+            timeout=30,
+        )
+        gh_authenticated = auth_result["ok"]
+        gh_auth_message = auth_result["output"]
+
+    return {
+        "source_mode": source_available,
+        "source_reason": source_reason,
+        "repo_root": str(repo_root) if repo_root else "",
+        "branch": branch,
+        "remote": remote,
+        "changed_files": len(status_lines),
+        "status_lines": status_lines[:30],
+        "last_commit": last_commit,
+        "upstream": upstream,
+        "git_installed": bool(shutil.which("git")),
+        "gh_installed": gh_installed,
+        "gh_authenticated": gh_authenticated,
+        "gh_auth_message": gh_auth_message,
+        "release_assets": latest_release_assets(),
+    }
+
+
+def publish_project_to_github(commit_message: str) -> dict[str, Any]:
+    """Audita, adiciona, commita e envia a branch atual para origin."""
+    environment = git_github_environment()
+
+    if not environment["source_mode"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=environment["source_reason"] or "Git indisponível.",
+        )
+
+    audit = run_git_security_audit()
+
+    if audit["blocking_count"] > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Publicação bloqueada: {audit['blocking_count']} "
+                "risco(s) de segurança encontrado(s)."
+            ),
+        )
+
+    repo_root = Path(environment["repo_root"])
+    branch = environment["branch"] or "main"
+    remote = environment["remote"]
+
+    if not remote:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="O remote 'origin' não está configurado.",
+        )
+
+    logs: list[str] = []
+
+    add_result = _run_process(
+        ["git", "add", "-A"],
+        cwd=repo_root,
+        timeout=60,
+    )
+    logs.append("$ git add -A")
+    if add_result["output"]:
+        logs.append(add_result["output"])
+
+    if not add_result["ok"]:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=add_result["output"] or "git add falhou.",
+        )
+
+    # Reexecuta auditoria após staging.
+    staged_audit = run_git_security_audit()
+    if staged_audit["blocking_count"] > 0:
+        _run_process(["git", "reset"], cwd=repo_root, timeout=30)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "O staging foi cancelado porque a auditoria encontrou "
+                f"{staged_audit['blocking_count']} risco(s)."
+            ),
+        )
+
+    diff_result = _run_process(
+        ["git", "diff", "--cached", "--quiet"],
+        cwd=repo_root,
+        timeout=30,
+    )
+
+    committed = False
+    if diff_result["returncode"] == 1:
+        commit_result = _run_process(
+            ["git", "commit", "-m", commit_message.strip()],
+            cwd=repo_root,
+            timeout=120,
+        )
+        logs.append(f"$ git commit -m {commit_message.strip()!r}")
+        if commit_result["output"]:
+            logs.append(commit_result["output"])
+
+        if not commit_result["ok"]:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=commit_result["output"] or "git commit falhou.",
+            )
+        committed = True
+
+    push_result = _run_process(
+        ["git", "push", "origin", branch],
+        cwd=repo_root,
+        timeout=180,
+    )
+    logs.append(f"$ git push origin {branch}")
+    if push_result["output"]:
+        logs.append(push_result["output"])
+
+    if not push_result["ok"]:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=push_result["output"] or "git push falhou.",
+        )
+
+    return {
+        "message": "Projeto enviado ao GitHub com sucesso.",
+        "committed": committed,
+        "branch": branch,
+        "remote": remote,
+        "log": logs,
+        "audit": staged_audit,
+    }
+
+
+def create_github_release(payload: GitReleaseRequest) -> dict[str, Any]:
+    """Cria uma GitHub Release usando gh CLI já autenticado."""
+    environment = git_github_environment()
+
+    if not environment["source_mode"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=environment["source_reason"] or "Git indisponível.",
+        )
+
+    if not environment["gh_installed"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "GitHub CLI (gh) não está instalado. "
+                "Instale com: winget install --id GitHub.cli"
+            ),
+        )
+
+    if not environment["gh_authenticated"]:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="GitHub CLI não está autenticado. Execute: gh auth login",
+        )
+
+    audit = run_git_security_audit()
+    if audit["blocking_count"] > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Release bloqueada até a auditoria de segurança ficar sem riscos altos.",
+        )
+
+    repo_root = Path(environment["repo_root"])
+    assets = latest_release_assets()
+
+    msix_path = Path(assets["msix"]) if assets["msix"] else None
+    if not msix_path or not msix_path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Nenhum MSIX foi encontrado na pasta release.",
+        )
+
+    tag = payload.tag.strip()
+    title = payload.title.strip()
+
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", tag):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A tag contém caracteres inválidos.",
+        )
+
+    existing = _run_process(
+        ["gh", "release", "view", tag],
+        cwd=repo_root,
+        timeout=30,
+    )
+    if existing["ok"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A release {tag} já existe.",
+        )
+
+    command = [
+        "gh",
+        "release",
+        "create",
+        tag,
+        str(msix_path),
+        "--title",
+        title,
+        "--notes",
+        payload.notes.strip() or f"Release {title}",
+        "--target",
+        environment["branch"] or "main",
+    ]
+
+    certificate = Path(assets["certificate"]) if assets["certificate"] else None
+    if (
+        payload.include_certificate
+        and certificate
+        and certificate.is_file()
+    ):
+        command.insert(4, str(certificate))
+
+    if payload.draft:
+        command.append("--draft")
+
+    result = _run_process(
+        command,
+        cwd=repo_root,
+        timeout=180,
+    )
+
+    if not result["ok"]:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=result["output"] or "Falha ao criar GitHub Release.",
+        )
+
+    release_url = ""
+    for line in result["output"].splitlines():
+        if line.strip().startswith("https://"):
+            release_url = line.strip()
+
+    if not release_url:
+        view_result = _run_process(
+            [
+                "gh",
+                "release",
+                "view",
+                tag,
+                "--json",
+                "url",
+                "--jq",
+                ".url",
+            ],
+            cwd=repo_root,
+            timeout=30,
+        )
+        if view_result["ok"]:
+            release_url = view_result["output"].strip()
+
+    return {
+        "message": f"Release {tag} criada com sucesso.",
+        "tag": tag,
+        "title": title,
+        "url": release_url,
+        "msix": str(msix_path),
+        "certificate": (
+            str(certificate)
+            if payload.include_certificate and certificate and certificate.is_file()
+            else ""
+        ),
+        "draft": payload.draft,
+        "output": result["output"],
+    }
 
 
 def _local_request_only(request: Request) -> None:
@@ -1891,6 +2565,18 @@ class ProjectResourcesOrderRequest(BaseModel):
     resources: list[ProjectResourceRequest]
 
 
+class GitPublishRequest(BaseModel):
+    commit_message: str = Field(..., min_length=1, max_length=160)
+
+
+class GitReleaseRequest(BaseModel):
+    tag: str = Field(..., min_length=1, max_length=80)
+    title: str = Field(..., min_length=1, max_length=140)
+    notes: str = Field(default="", max_length=5000)
+    include_certificate: bool = True
+    draft: bool = False
+
+
 # ============================================================
 # DADOS INICIAIS
 # ============================================================
@@ -3094,6 +3780,9 @@ INDEX_HTML = r'''
             <a href="/workspace" class="sidebar-item relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-left text-sm text-slate-400">
                 <span class="w-5 text-center">◈</span>
                 <span class="flex-1 font-semibold">PERSONALIZAR ÁREA</span>
+            </a>
+            <a href="/git-github" class="sidebar-item relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
+                <span class="w-5 text-center">⑂</span><span class="flex-1 font-semibold">GIT &amp; GITHUB</span>
             </a>
 
             <a href="/windows-diagnostics" class="sidebar-item relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-left text-sm text-slate-400">
@@ -4532,6 +5221,9 @@ APPS_HTML = r'''
             <a href="/workspace" class="sidebar-item relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
                 <span class="w-5 text-center">◈</span><span class="flex-1 font-semibold">PERSONALIZAR ÁREA</span>
             </a>
+            <a href="/git-github" class="sidebar-item relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
+                <span class="w-5 text-center">⑂</span><span class="flex-1 font-semibold">GIT &amp; GITHUB</span>
+            </a>
             <a href="/windows-diagnostics" class="sidebar-item relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
                 <span class="w-5 text-center">🩺</span><span class="flex-1 font-semibold">DIAGNÓSTICO WIN</span>
             </a>
@@ -5158,6 +5850,9 @@ LINKS_HTML = r"""
 
             <a href="/workspace" class="sidebar-item relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
                 <span class="w-5 text-center">◈</span><span class="font-semibold">PERSONALIZAR ÁREA</span>
+            </a>
+            <a href="/git-github" class="sidebar-item relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
+                <span class="w-5 text-center">⑂</span><span class="flex-1 font-semibold">GIT &amp; GITHUB</span>
             </a>
 
             <a href="/windows-diagnostics" class="sidebar-item relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
@@ -6239,6 +6934,9 @@ LOCAL_APPS_HTML = r"""
             <a href="/workspace" class="sidebar-item relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
                 <span class="w-5 text-center">◈</span><span class="font-semibold">PERSONALIZAR ÁREA</span>
             </a>
+            <a href="/git-github" class="sidebar-item relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
+                <span class="w-5 text-center">⑂</span><span class="flex-1 font-semibold">GIT &amp; GITHUB</span>
+            </a>
 
             <a href="/windows-diagnostics" class="sidebar-item relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
                 <span class="w-5 text-center">🩺</span><span class="font-semibold">DIAGNÓSTICO WIN</span>
@@ -6845,6 +7543,9 @@ WINDOWS_DIAGNOSTICS_HTML = r"""
 
             <a href="/workspace" class="sidebar-item relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
                 <span class="w-5 text-center">◈</span><span class="font-semibold">PERSONALIZAR ÁREA</span>
+            </a>
+            <a href="/git-github" class="sidebar-item relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
+                <span class="w-5 text-center">⑂</span><span class="flex-1 font-semibold">GIT &amp; GITHUB</span>
             </a>
 
             <a href="/windows-diagnostics" class="sidebar-item active relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-300">
@@ -7479,6 +8180,9 @@ WORKSPACE_HTML = r"""
             </a>
             <a href="/workspace" class="sidebar-item active relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-300">
                 <span class="w-5 text-center">◈</span><span class="font-semibold">PERSONALIZAR ÁREA</span>
+            </a>
+            <a href="/git-github" class="sidebar-item relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
+                <span class="w-5 text-center">⑂</span><span class="flex-1 font-semibold">GIT &amp; GITHUB</span>
             </a>
             <a href="/windows-diagnostics" class="sidebar-item relative mt-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
                 <span class="w-5 text-center">🩺</span><span class="font-semibold">DIAGNÓSTICO WIN</span>
@@ -8978,6 +9682,655 @@ WORKSPACE_HTML = r"""
 """
 
 
+
+# ============================================================
+# FRONTEND - GIT & GITHUB
+# ============================================================
+
+GIT_GITHUB_HTML = r"""
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="dark">
+    <link rel="icon" type="image/png" href="/brand-image">
+    <title>Git & GitHub • TECH TOOL HUB</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <style>
+        body {
+            min-height: 100vh;
+            margin: 0;
+            background:
+                radial-gradient(circle at 78% 4%, rgba(44,196,219,.08), transparent 28rem),
+                linear-gradient(145deg, #05101a 0%, #071722 48%, #05111c 100%);
+        }
+
+        * { scrollbar-width: thin; scrollbar-color: #1a4055 #071722; }
+
+        .glass-top {
+            background: rgba(7,24,36,.92);
+            backdrop-filter: blur(18px);
+            -webkit-backdrop-filter: blur(18px);
+        }
+
+        .sidebar-item {
+            transition: border-color .18s ease, background .18s ease, color .18s ease;
+        }
+
+        .sidebar-item:hover,
+        .sidebar-item.active {
+            color: #dffaff;
+            background: linear-gradient(90deg, rgba(28,141,169,.27), rgba(14,72,94,.13));
+            border-color: rgba(53,213,230,.20);
+        }
+
+        .sidebar-item.active::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 9px;
+            bottom: 9px;
+            width: 3px;
+            border-radius: 0 4px 4px 0;
+            background: #35d5e6;
+        }
+
+        .panel {
+            border: 1px solid rgba(129,180,204,.13);
+            background: linear-gradient(145deg, rgba(13,35,50,.93), rgba(8,25,37,.96));
+        }
+
+        .status-card {
+            border: 1px solid rgba(129,180,204,.12);
+            background: rgba(5,22,33,.62);
+        }
+
+        .action-card {
+            border: 1px solid rgba(129,180,204,.12);
+            background: rgba(6,25,37,.76);
+        }
+
+        .log-box {
+            background: #04111a;
+            border: 1px solid rgba(129,180,204,.12);
+        }
+
+        .finding-high {
+            border-color: rgba(248,113,113,.25);
+            background: rgba(127,29,29,.12);
+        }
+
+        .finding-warning {
+            border-color: rgba(251,191,36,.22);
+            background: rgba(120,53,15,.10);
+        }
+
+        @media (max-width: 1023px) {
+            #gitSidebar {
+                transform: translateX(-100%);
+                transition: transform .22s ease;
+            }
+
+            #gitSidebar.open {
+                transform: translateX(0);
+            }
+        }
+    </style>
+</head>
+
+<body class="text-slate-100 antialiased">
+    <div id="gitSidebarOverlay" class="fixed inset-0 z-30 hidden bg-black/55 lg:hidden"></div>
+
+    <aside id="gitSidebar" class="fixed inset-y-0 left-0 z-40 flex w-[242px] flex-col border-r border-slate-700/20 bg-[#071722]/95 shadow-2xl lg:translate-x-0">
+        <a href="/" class="flex h-[132px] flex-col items-center justify-center border-b border-slate-700/20 px-3 py-3 text-center">
+            <img src="/brand-image" alt="TECH TOOL HUB" class="max-h-[82px] w-full max-w-[104px] object-contain">
+            <div class="mt-2 leading-tight">
+                <div class="text-sm font-black tracking-[.14em] text-slate-100">TECH TOOL HUB</div>
+                <div class="mt-1 text-[10px] font-semibold uppercase tracking-[.30em] text-cyan-400/75">LOCAL WORKSPACE</div>
+            </div>
+        </a>
+
+        <nav class="flex-1 overflow-y-auto px-3 py-5">
+            <p class="mb-2 px-3 text-[10px] font-bold uppercase tracking-[.18em] text-slate-600">Navegação</p>
+
+            <a href="/apps" class="sidebar-item relative flex items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
+                <span class="w-5 text-center">▦</span><span class="font-semibold">APPS + USADOS</span>
+            </a>
+            <a href="/local-apps" class="sidebar-item relative mt-1 flex items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
+                <span class="w-5 text-center">▣</span><span class="font-semibold">APPS LOCAIS</span>
+            </a>
+            <a href="/links" class="sidebar-item relative mt-1 flex items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
+                <span class="w-5 text-center">★</span><span class="font-semibold">LINKS FAVORITOS</span>
+            </a>
+            <a href="/workspace" class="sidebar-item relative mt-1 flex items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
+                <span class="w-5 text-center">◈</span><span class="font-semibold">PERSONALIZAR ÁREA</span>
+            </a>
+            <a href="/git-github" class="sidebar-item active relative mt-1 flex items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-300">
+                <span class="w-5 text-center">⑂</span><span class="font-semibold">GIT &amp; GITHUB</span>
+            </a>
+            <a href="/windows-diagnostics" class="sidebar-item relative mt-1 flex items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
+                <span class="w-5 text-center">🩺</span><span class="font-semibold">DIAGNÓSTICO WIN</span>
+            </a>
+            <a href="/" class="sidebar-item relative mt-1 flex items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-sm text-slate-400">
+                <span class="w-5 text-center">☷</span><span class="font-semibold">All tools</span>
+            </a>
+        </nav>
+    </aside>
+
+    <div class="min-h-screen lg:pl-[242px]">
+        <header class="glass-top sticky top-0 z-20 border-b border-slate-700/20">
+            <div class="flex min-h-[72px] flex-wrap items-center gap-3 px-4 py-3 sm:px-6 xl:px-8">
+                <button id="gitMenuBtn" class="grid h-10 w-10 place-items-center rounded-xl border border-slate-700/30 bg-[#0a1d2b] text-slate-300 lg:hidden">☰</button>
+
+                <div class="min-w-[200px] flex-1">
+                    <h1 class="text-base font-bold tracking-[.12em] text-slate-100">GIT &amp; GITHUB</h1>
+                    <p class="mt-0.5 text-[10px] uppercase tracking-[.17em] text-slate-600">Segurança • Commit • Push • Release</p>
+                </div>
+
+                <button id="refreshGitStatusBtn" class="h-10 rounded-xl border border-slate-700/30 bg-[#091c29] px-4 text-xs font-bold text-slate-300 hover:border-cyan-400/25 hover:text-cyan-200">
+                    ↻ Atualizar status
+                </button>
+            </div>
+        </header>
+
+        <main class="mx-auto max-w-[1500px] px-4 py-6 sm:px-6 xl:px-8">
+            <section class="mb-5">
+                <p class="text-xs font-semibold uppercase tracking-[.18em] text-cyan-400/65">Pipeline local seguro</p>
+                <h2 class="mt-1 text-2xl font-bold tracking-tight text-slate-100">Publicação do projeto</h2>
+                <p class="mt-1 max-w-4xl text-sm leading-6 text-slate-500">
+                    Audite vazamentos, publique alterações no GitHub e crie releases sem gravar token no TECH TOOL HUB.
+                    O acesso ao GitHub usa a autenticação existente do Git/GitHub CLI.
+                </p>
+            </section>
+
+            <!-- STATUS -->
+            <section class="panel rounded-2xl p-4 sm:p-5">
+                <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                        <h3 class="text-sm font-bold text-slate-200">Ambiente</h3>
+                        <p id="environmentMessage" class="mt-0.5 text-[10px] text-slate-600">Verificando Git e GitHub...</p>
+                    </div>
+                    <span id="sourceModeBadge" class="rounded-lg border border-slate-700/25 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[.08em] text-slate-500">...</span>
+                </div>
+
+                <div class="mt-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
+                    <div class="status-card rounded-xl p-3">
+                        <div class="text-[9px] font-bold uppercase tracking-[.12em] text-slate-600">Branch</div>
+                        <div id="gitBranch" class="mt-1 truncate text-sm font-bold text-slate-300">—</div>
+                    </div>
+                    <div class="status-card rounded-xl p-3">
+                        <div class="text-[9px] font-bold uppercase tracking-[.12em] text-slate-600">Alterações locais</div>
+                        <div id="gitChangedFiles" class="mt-1 text-xl font-black text-slate-200">0</div>
+                    </div>
+                    <div class="status-card rounded-xl p-3">
+                        <div class="text-[9px] font-bold uppercase tracking-[.12em] text-slate-600">GitHub CLI</div>
+                        <div id="ghStatus" class="mt-1 text-sm font-bold text-slate-300">—</div>
+                    </div>
+                    <div class="status-card rounded-xl p-3">
+                        <div class="text-[9px] font-bold uppercase tracking-[.12em] text-slate-600">MSIX mais recente</div>
+                        <div id="latestMsixName" class="mt-1 truncate text-xs font-bold text-slate-300">—</div>
+                    </div>
+                </div>
+
+                <div class="mt-3 rounded-xl border border-slate-700/20 bg-[#061722] px-4 py-3">
+                    <div class="text-[9px] font-bold uppercase tracking-[.12em] text-slate-600">Origin</div>
+                    <div id="gitRemote" class="mt-1 break-all text-xs text-slate-400">—</div>
+                </div>
+            </section>
+
+            <!-- AÇÕES -->
+            <div class="mt-5 grid gap-5 xl:grid-cols-3">
+                <!-- SEGURANÇA -->
+                <section class="action-card rounded-2xl p-5">
+                    <div class="flex items-start justify-between gap-3">
+                        <div>
+                            <div class="text-[10px] font-bold uppercase tracking-[.12em] text-cyan-400/60">Etapa 1</div>
+                            <h3 class="mt-1 text-lg font-bold text-slate-100">Checar vazamentos</h3>
+                            <p class="mt-1 text-xs leading-5 text-slate-500">Verifica arquivos que podem entrar no Git e procura credenciais, dados locais e artefatos proibidos.</p>
+                        </div>
+                        <div class="text-2xl">⌕</div>
+                    </div>
+
+                    <div class="mt-4 grid grid-cols-3 gap-2">
+                        <div class="rounded-lg border border-slate-700/20 bg-[#061722] p-2 text-center">
+                            <div id="auditCandidates" class="text-lg font-black text-slate-200">—</div>
+                            <div class="text-[9px] text-slate-600">arquivos</div>
+                        </div>
+                        <div class="rounded-lg border border-slate-700/20 bg-[#061722] p-2 text-center">
+                            <div id="auditBlocking" class="text-lg font-black text-red-300">—</div>
+                            <div class="text-[9px] text-slate-600">riscos</div>
+                        </div>
+                        <div class="rounded-lg border border-slate-700/20 bg-[#061722] p-2 text-center">
+                            <div id="auditWarnings" class="text-lg font-black text-amber-200">—</div>
+                            <div class="text-[9px] text-slate-600">avisos</div>
+                        </div>
+                    </div>
+
+                    <button id="runSecurityAuditBtn" class="mt-4 h-11 w-full rounded-xl border border-cyan-400/20 bg-cyan-400/10 text-xs font-bold text-cyan-200 hover:bg-cyan-400/15 disabled:cursor-not-allowed disabled:opacity-40">
+                        Executar checagem
+                    </button>
+
+                    <div id="auditResult" class="mt-4 hidden"></div>
+                </section>
+
+                <!-- GIT PUSH -->
+                <section class="action-card rounded-2xl p-5">
+                    <div class="flex items-start justify-between gap-3">
+                        <div>
+                            <div class="text-[10px] font-bold uppercase tracking-[.12em] text-cyan-400/60">Etapa 2</div>
+                            <h3 class="mt-1 text-lg font-bold text-slate-100">Enviar ao GitHub</h3>
+                            <p class="mt-1 text-xs leading-5 text-slate-500">Executa auditoria, git add, commit e push da branch atual para origin.</p>
+                        </div>
+                        <div class="text-2xl">⑂</div>
+                    </div>
+
+                    <label class="mt-4 block">
+                        <span class="mb-1.5 block text-[10px] font-bold uppercase tracking-[.08em] text-slate-600">Mensagem do commit</span>
+                        <input id="commitMessageInput" maxlength="160" value="Atualiza TECH TOOL HUB" class="h-11 w-full rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-sm text-slate-200 outline-none focus:border-cyan-400/35">
+                    </label>
+
+                    <button id="publishGitBtn" class="mt-4 h-11 w-full rounded-xl border border-emerald-400/20 bg-emerald-400/10 text-xs font-bold text-emerald-200 hover:bg-emerald-400/15 disabled:cursor-not-allowed disabled:opacity-40">
+                        Auditar e publicar
+                    </button>
+
+                    <div id="publishResult" class="mt-4 hidden"></div>
+                </section>
+
+                <!-- RELEASE -->
+                <section class="action-card rounded-2xl p-5">
+                    <div class="flex items-start justify-between gap-3">
+                        <div>
+                            <div class="text-[10px] font-bold uppercase tracking-[.12em] text-cyan-400/60">Etapa 3</div>
+                            <h3 class="mt-1 text-lg font-bold text-slate-100">Criar Release</h3>
+                            <p class="mt-1 text-xs leading-5 text-slate-500">Publica o MSIX mais recente usando o GitHub CLI autenticado.</p>
+                        </div>
+                        <div class="text-2xl">⬡</div>
+                    </div>
+
+                    <div class="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
+                        <label>
+                            <span class="mb-1.5 block text-[10px] font-bold uppercase tracking-[.08em] text-slate-600">Tag</span>
+                            <input id="releaseTagInput" placeholder="v2.24.0" class="h-10 w-full rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-sm text-slate-200 outline-none focus:border-cyan-400/35">
+                        </label>
+                        <label>
+                            <span class="mb-1.5 block text-[10px] font-bold uppercase tracking-[.08em] text-slate-600">Título</span>
+                            <input id="releaseTitleInput" placeholder="TECH TOOL HUB v2.24.0" class="h-10 w-full rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-sm text-slate-200 outline-none focus:border-cyan-400/35">
+                        </label>
+                    </div>
+
+                    <label class="mt-3 block">
+                        <span class="mb-1.5 block text-[10px] font-bold uppercase tracking-[.08em] text-slate-600">Notas</span>
+                        <textarea id="releaseNotesInput" rows="4" maxlength="5000" placeholder="Principais mudanças desta versão..." class="w-full resize-none rounded-xl border border-slate-700/30 bg-[#061722] px-3 py-3 text-sm text-slate-200 outline-none focus:border-cyan-400/35"></textarea>
+                    </label>
+
+                    <div class="mt-3 flex flex-wrap gap-4 text-xs text-slate-500">
+                        <label class="flex items-center gap-2">
+                            <input id="includeCertificateInput" type="checkbox" checked class="accent-cyan-400">
+                            Incluir .cer
+                        </label>
+                        <label class="flex items-center gap-2">
+                            <input id="releaseDraftInput" type="checkbox" class="accent-cyan-400">
+                            Criar como rascunho
+                        </label>
+                    </div>
+
+                    <button id="createReleaseBtn" class="mt-4 h-11 w-full rounded-xl border border-blue-400/20 bg-blue-400/10 text-xs font-bold text-blue-200 hover:bg-blue-400/15 disabled:cursor-not-allowed disabled:opacity-40">
+                        Criar GitHub Release
+                    </button>
+
+                    <div id="releaseResult" class="mt-4 hidden"></div>
+                </section>
+            </div>
+
+            <!-- LOG / DETALHES -->
+            <section class="panel mt-5 rounded-2xl p-5">
+                <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                        <h3 class="text-sm font-bold text-slate-200">Log da sessão</h3>
+                        <p class="mt-0.5 text-[10px] text-slate-600">Saída das ações executadas nesta página.</p>
+                    </div>
+                    <button id="clearGitLogBtn" class="h-8 rounded-lg border border-slate-700/25 px-3 text-[10px] font-semibold text-slate-500 hover:text-slate-300">Limpar</button>
+                </div>
+
+                <pre id="gitActionLog" class="log-box mt-3 min-h-[160px] max-h-[360px] overflow-auto whitespace-pre-wrap rounded-xl p-4 text-[11px] leading-5 text-slate-500">Pronto.</pre>
+            </section>
+        </main>
+    </div>
+
+    <div id="gitToast" class="pointer-events-none fixed bottom-5 right-5 z-[70] hidden max-w-sm rounded-xl border px-4 py-3 text-sm shadow-2xl"></div>
+
+    <script>
+        const state = {
+            environment: null,
+            audit: null
+        };
+
+        const environmentMessage = document.getElementById('environmentMessage');
+        const sourceModeBadge = document.getElementById('sourceModeBadge');
+        const gitBranch = document.getElementById('gitBranch');
+        const gitChangedFiles = document.getElementById('gitChangedFiles');
+        const ghStatus = document.getElementById('ghStatus');
+        const latestMsixName = document.getElementById('latestMsixName');
+        const gitRemote = document.getElementById('gitRemote');
+
+        const auditCandidates = document.getElementById('auditCandidates');
+        const auditBlocking = document.getElementById('auditBlocking');
+        const auditWarnings = document.getElementById('auditWarnings');
+        const auditResult = document.getElementById('auditResult');
+
+        const commitMessageInput = document.getElementById('commitMessageInput');
+        const publishResult = document.getElementById('publishResult');
+
+        const releaseTagInput = document.getElementById('releaseTagInput');
+        const releaseTitleInput = document.getElementById('releaseTitleInput');
+        const releaseNotesInput = document.getElementById('releaseNotesInput');
+        const includeCertificateInput = document.getElementById('includeCertificateInput');
+        const releaseDraftInput = document.getElementById('releaseDraftInput');
+        const releaseResult = document.getElementById('releaseResult');
+
+        const gitActionLog = document.getElementById('gitActionLog');
+        const gitToast = document.getElementById('gitToast');
+
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;')
+                .replaceAll('"', '&quot;')
+                .replaceAll("'", '&#039;');
+        }
+
+        function basename(path) {
+            return String(path || '').split(/[\\/]/).pop() || '';
+        }
+
+        function showToast(message, error = false) {
+            gitToast.textContent = message;
+            gitToast.className =
+                'pointer-events-none fixed bottom-5 right-5 z-[70] max-w-sm rounded-xl border px-4 py-3 text-sm shadow-2xl ' +
+                (error
+                    ? 'border-red-900/60 bg-red-950/95 text-red-200'
+                    : 'border-cyan-900/60 bg-[#092633]/95 text-cyan-100');
+
+            gitToast.classList.remove('hidden');
+            clearTimeout(showToast.timer);
+            showToast.timer = setTimeout(() => gitToast.classList.add('hidden'), 2600);
+        }
+
+        function appendLog(message) {
+            const stamp = new Date().toLocaleTimeString('pt-BR');
+            const current = gitActionLog.textContent === 'Pronto.' ? '' : gitActionLog.textContent;
+            gitActionLog.textContent = `${current}${current ? '\n\n' : ''}[${stamp}] ${message}`;
+            gitActionLog.scrollTop = gitActionLog.scrollHeight;
+        }
+
+        function resultBox(element, message, error = false, link = '') {
+            element.className =
+                'mt-4 rounded-xl border px-3 py-3 text-xs ' +
+                (error
+                    ? 'border-red-900/40 bg-red-950/20 text-red-300'
+                    : 'border-emerald-900/35 bg-emerald-950/15 text-emerald-300');
+
+            element.innerHTML = `
+                <div>${escapeHtml(message)}</div>
+                ${link ? `<a href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer" class="mt-2 inline-block font-bold text-cyan-300 hover:text-cyan-200">Abrir Release ↗</a>` : ''}
+            `;
+            element.classList.remove('hidden');
+        }
+
+        async function loadEnvironment() {
+            const refreshButton = document.getElementById('refreshGitStatusBtn');
+            refreshButton.disabled = true;
+
+            try {
+                const response = await fetch('/api/git-dashboard/status', { cache: 'no-store' });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || 'Falha ao consultar ambiente.');
+
+                state.environment = data;
+
+                gitBranch.textContent = data.branch || '—';
+                gitChangedFiles.textContent = data.changed_files ?? 0;
+                gitRemote.textContent = data.remote || 'origin não configurado';
+
+                sourceModeBadge.textContent = data.source_mode ? 'Fonte pronta' : 'Indisponível';
+                sourceModeBadge.className =
+                    'rounded-lg border px-2.5 py-1 text-[10px] font-bold uppercase tracking-[.08em] ' +
+                    (data.source_mode
+                        ? 'border-emerald-400/20 bg-emerald-400/5 text-emerald-300'
+                        : 'border-amber-400/20 bg-amber-400/5 text-amber-200');
+
+                environmentMessage.textContent = data.source_mode
+                    ? `Repositório: ${data.repo_root}`
+                    : (data.source_reason || 'Modo Git indisponível.');
+
+                ghStatus.textContent = data.gh_authenticated
+                    ? 'Autenticado'
+                    : (data.gh_installed ? 'Login necessário' : 'Não instalado');
+
+                const assets = data.release_assets || {};
+                latestMsixName.textContent = assets.msix ? basename(assets.msix) : 'Nenhum MSIX';
+
+                if (!releaseTagInput.value && assets.suggested_tag) {
+                    releaseTagInput.value = assets.suggested_tag;
+                }
+
+                if (!releaseTitleInput.value && assets.suggested_title) {
+                    releaseTitleInput.value = assets.suggested_title;
+                }
+
+                const actionsAvailable = Boolean(data.source_mode);
+
+                document.getElementById('runSecurityAuditBtn').disabled = !actionsAvailable;
+                document.getElementById('publishGitBtn').disabled = !actionsAvailable;
+                document.getElementById('createReleaseBtn').disabled =
+                    !actionsAvailable ||
+                    !data.gh_authenticated ||
+                    !assets.msix;
+
+            } catch (error) {
+                showToast(error.message || 'Erro ao carregar status.', true);
+            } finally {
+                refreshButton.disabled = false;
+            }
+        }
+
+        async function runSecurityAudit() {
+            const button = document.getElementById('runSecurityAuditBtn');
+            button.disabled = true;
+            button.textContent = 'Verificando...';
+            auditResult.classList.add('hidden');
+
+            try {
+                const response = await fetch('/api/git-dashboard/security-check', {
+                    method: 'POST'
+                });
+                const data = await response.json();
+
+                if (!response.ok) throw new Error(data.detail || 'Falha na auditoria.');
+
+                state.audit = data;
+
+                auditCandidates.textContent = data.candidate_count ?? 0;
+                auditBlocking.textContent = data.blocking_count ?? 0;
+                auditWarnings.textContent = data.warning_count ?? 0;
+
+                const findings = Array.isArray(data.findings) ? data.findings : [];
+
+                auditResult.className = 'mt-4 space-y-2';
+                auditResult.innerHTML = `
+                    <div class="rounded-xl border px-3 py-3 text-xs ${
+                        data.safe
+                            ? 'border-emerald-900/35 bg-emerald-950/15 text-emerald-300'
+                            : 'border-red-900/40 bg-red-950/20 text-red-300'
+                    }">
+                        ${data.safe
+                            ? '✓ Nenhum risco alto encontrado.'
+                            : `⚠ ${data.blocking_count} risco(s) alto(s) bloqueiam a publicação.`}
+                    </div>
+
+                    ${findings.slice(0, 12).map(finding => `
+                        <div class="rounded-lg border p-2.5 ${
+                            finding.severity === 'high'
+                                ? 'finding-high'
+                                : 'finding-warning'
+                        }">
+                            <div class="text-[10px] font-bold ${
+                                finding.severity === 'high'
+                                    ? 'text-red-300'
+                                    : 'text-amber-200'
+                            }">${escapeHtml(finding.file)}${finding.line ? `:${finding.line}` : ''}</div>
+                            <div class="mt-1 text-[10px] leading-4 text-slate-500">${escapeHtml(finding.message)}</div>
+                        </div>
+                    `).join('')}
+                `;
+
+                appendLog(
+                    `Auditoria: ${data.blocking_count} risco(s) alto(s), ` +
+                    `${data.warning_count} aviso(s), ${data.candidate_count} arquivo(s) analisados.`
+                );
+
+            } catch (error) {
+                resultBox(auditResult, error.message || 'Erro na auditoria.', true);
+                appendLog(`ERRO auditoria: ${error.message || error}`);
+            } finally {
+                button.disabled = false;
+                button.textContent = 'Executar checagem';
+            }
+        }
+
+        async function publishProject() {
+            const button = document.getElementById('publishGitBtn');
+            const commitMessage = commitMessageInput.value.trim();
+
+            if (!commitMessage) {
+                showToast('Informe a mensagem do commit.', true);
+                commitMessageInput.focus();
+                return;
+            }
+
+            button.disabled = true;
+            button.textContent = 'Publicando...';
+            publishResult.classList.add('hidden');
+
+            try {
+                const response = await fetch('/api/git-dashboard/publish', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ commit_message: commitMessage })
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) throw new Error(data.detail || 'Falha na publicação.');
+
+                resultBox(
+                    publishResult,
+                    data.committed
+                        ? `Commit criado e branch ${data.branch} enviada ao GitHub.`
+                        : `Nenhuma mudança nova para commit. Branch ${data.branch} sincronizada.`
+                );
+
+                appendLog((data.log || []).join('\n'));
+                showToast('Projeto publicado no GitHub.');
+                await loadEnvironment();
+
+            } catch (error) {
+                resultBox(publishResult, error.message || 'Erro ao publicar.', true);
+                appendLog(`ERRO publicação: ${error.message || error}`);
+            } finally {
+                button.disabled = false;
+                button.textContent = 'Auditar e publicar';
+            }
+        }
+
+        async function createRelease() {
+            const button = document.getElementById('createReleaseBtn');
+
+            const payload = {
+                tag: releaseTagInput.value.trim(),
+                title: releaseTitleInput.value.trim(),
+                notes: releaseNotesInput.value.trim(),
+                include_certificate: includeCertificateInput.checked,
+                draft: releaseDraftInput.checked
+            };
+
+            if (!payload.tag || !payload.title) {
+                showToast('Informe a tag e o título da Release.', true);
+                return;
+            }
+
+            button.disabled = true;
+            button.textContent = 'Criando Release...';
+            releaseResult.classList.add('hidden');
+
+            try {
+                const response = await fetch('/api/git-dashboard/release', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) throw new Error(data.detail || 'Falha ao criar Release.');
+
+                resultBox(
+                    releaseResult,
+                    `${data.tag} criada com sucesso.`,
+                    false,
+                    data.url || ''
+                );
+
+                appendLog(
+                    `Release ${data.tag}\nMSIX: ${data.msix}` +
+                    (data.certificate ? `\nCertificado: ${data.certificate}` : '') +
+                    (data.url ? `\nURL: ${data.url}` : '')
+                );
+
+                showToast('GitHub Release criada.');
+                await loadEnvironment();
+
+            } catch (error) {
+                resultBox(releaseResult, error.message || 'Erro ao criar Release.', true);
+                appendLog(`ERRO Release: ${error.message || error}`);
+            } finally {
+                button.disabled = false;
+                button.textContent = 'Criar GitHub Release';
+            }
+        }
+
+        document.getElementById('refreshGitStatusBtn').addEventListener('click', loadEnvironment);
+        document.getElementById('runSecurityAuditBtn').addEventListener('click', runSecurityAudit);
+        document.getElementById('publishGitBtn').addEventListener('click', publishProject);
+        document.getElementById('createReleaseBtn').addEventListener('click', createRelease);
+
+        document.getElementById('clearGitLogBtn').addEventListener('click', () => {
+            gitActionLog.textContent = 'Pronto.';
+        });
+
+        const gitSidebar = document.getElementById('gitSidebar');
+        const gitSidebarOverlay = document.getElementById('gitSidebarOverlay');
+
+        document.getElementById('gitMenuBtn').addEventListener('click', () => {
+            gitSidebar.classList.add('open');
+            gitSidebarOverlay.classList.remove('hidden');
+        });
+
+        gitSidebarOverlay.addEventListener('click', () => {
+            gitSidebar.classList.remove('open');
+            gitSidebarOverlay.classList.add('hidden');
+        });
+
+        loadEnvironment();
+    </script>
+</body>
+</html>
+"""
+
+
 # ============================================================
 # ROTAS
 # ============================================================
@@ -9016,6 +10369,12 @@ def windows_diagnostics_page() -> HTMLResponse:
 def workspace_page() -> HTMLResponse:
     """Entrega a área personalizada de projetos."""
     return HTMLResponse(content=WORKSPACE_HTML)
+
+
+@app.get("/git-github", response_class=HTMLResponse, include_in_schema=False)
+def git_github_page() -> HTMLResponse:
+    """Entrega o dashboard local de Git e GitHub."""
+    return HTMLResponse(content=GIT_GITHUB_HTML)
 
 
 @app.get("/api/projects")
@@ -10053,6 +11412,40 @@ def get_icon(filename: str) -> FileResponse:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ícone não encontrado.")
 
     return FileResponse(icon_file)
+
+
+@app.get("/api/git-dashboard/status")
+def git_dashboard_status(request: Request) -> dict[str, Any]:
+    """Resumo do Git, origin, GitHub CLI e assets locais."""
+    _local_request_only(request)
+    return git_github_environment()
+
+
+@app.post("/api/git-dashboard/security-check")
+def git_dashboard_security_check(request: Request) -> dict[str, Any]:
+    """Audita possíveis vazamentos antes de publicar."""
+    _local_request_only(request)
+    return run_git_security_audit()
+
+
+@app.post("/api/git-dashboard/publish")
+def git_dashboard_publish(
+    payload: GitPublishRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Executa auditoria, git add, commit e push."""
+    _local_request_only(request)
+    return publish_project_to_github(payload.commit_message)
+
+
+@app.post("/api/git-dashboard/release")
+def git_dashboard_release(
+    payload: GitReleaseRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Cria GitHub Release usando gh CLI autenticado."""
+    _local_request_only(request)
+    return create_github_release(payload)
 
 
 @app.get("/api/readme")

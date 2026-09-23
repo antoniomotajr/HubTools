@@ -194,3 +194,31 @@ NÃO use -ResumePackage, porque o EXE anterior contém o problema.
 Novo pacote:
 
     release\TechToolHub_2.23.5.0_x64.msix
+
+
+DASHBOARD GIT & GITHUB - v2.24.0
+--------------------------------
+Nova área:
+
+    http://127.0.0.1:8000/git-github
+
+Funções:
+1. Checar vazamentos antes de publicar.
+2. Automatizar git add / commit / push.
+3. Criar GitHub Release com o MSIX mais recente.
+
+Segurança:
+- as ações só aceitam acesso local;
+- não há campo para token;
+- a Release usa a sessão autenticada do GitHub CLI (gh);
+- publicação é bloqueada se a auditoria encontrar risco alto.
+
+GitHub CLI:
+    winget install --id GitHub.cli
+    gh auth login
+    gh auth status
+
+Para operar Git/GitHub:
+    python app.py
+
+O modo EXE/MSIX instalado não executa publicação do repositório fonte.

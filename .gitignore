@@ -1,27 +1,18 @@
-﻿# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.venv/
-venv/
-env/
+# TECH TOOL HUB - segurança Git/GitHub
 
-# PyInstaller
-build/
-dist/
-build-dashboard/
-build-msix/
-*.spec
-
-# Arquivos gerados
-release/
-*.msix
-*.exe
+# Segredos / credenciais
+.env
+.env.*
+!.env.example
 *.pfx
-*.cer
+*.p12
+*.pem
+*.key
+*.ppk
+*.jks
+*.keystore
 
-# Dados locais do usuário
+# Dados locais
 apps_data.json
 links_data.json
 projects_data.json
@@ -29,16 +20,45 @@ local_apps_data.json
 user_profile.json
 user_media/
 icons/
+.apps_catalog_v1_done
+.official_icons_v1_done
 
-# Logs e temporários
+# Build / executáveis / release
+build/
+dist/
+build-dashboard/
+build-msix/
+release/
+*.spec
+*.exe
+*.msix
+*.msixbundle
+*.appx
+*.appxbundle
+*.pdb
+*.cer
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs / temporários
 *.log
 *.tmp
+*.temp
 *.bak
+*.old
+*.dmp
 
-# Windows
+# Windows / IDE
 Thumbs.db
-desktop.ini
-
-# IDE
+Desktop.ini
+$RECYCLE.BIN/
 .vscode/
 .idea/
