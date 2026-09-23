@@ -1,0 +1,44 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# PyInstaller
+build/
+dist/
+build-dashboard/
+build-msix/
+*.spec
+
+# Arquivos gerados
+release/
+*.msix
+*.exe
+*.pfx
+*.cer
+
+# Dados locais do usuário
+apps_data.json
+links_data.json
+projects_data.json
+local_apps_data.json
+user_profile.json
+user_media/
+icons/
+
+# Logs e temporários
+*.log
+*.tmp
+*.bak
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
