@@ -57,3 +57,49 @@ repositório do projeto selecionado.
 Antes do push, o fluxo executa `git fetch origin` e, quando o remoto está
 à frente, `git pull --rebase origin <branch>`. Se houver conflito, o rebase
 é abortado para preservar o estado anterior e o push não é realizado.
+
+
+## Comandos individuais
+
+A partir da v2.24.2, o Dashboard oferece comandos Git individuais por
+ações estruturadas. Não há campo de terminal livre.
+
+Ações que podem colocar conteúdo no histórico ou enviar ao remoto
+(`add`, `commit` e `push`) são bloqueadas quando a auditoria encontra
+riscos altos.
+
+`git rm` foi implementado somente com `--cached`, portanto remove do
+índice do Git sem apagar o arquivo do computador.
+
+
+## Gerenciador da conta GitHub — v2.25.0
+
+O painel usa o `gh` autenticado e não persiste tokens.
+Mudanças para visibilidade pública pedem confirmação explícita.
+Rename e exclusão permanente exigem digitação exata de `owner/repo`.
+
+
+## Política zero-credenciais — v2.25.1
+
+- GitHub: usa a sessão externa do `gh auth`.
+- Sites: usam exclusivamente a sessão existente no navegador.
+- Aplicativos: usam a sessão do próprio aplicativo.
+- Favoritos do navegador: leitura/importação desativada.
+- Links pessoais: somente em memória; não são gravados.
+- Saídas Git: tokens e credenciais em URLs são mascarados.
+- APIs operacionais: `Cache-Control: no-store`.
+
+
+## Detecção do GitHub CLI — v2.25.2
+
+A localização de `gh.exe` é feita dinamicamente e não é persistida.
+O frontend recebe apenas uma identificação genérica da origem da
+detecção (`PATH`, `Program Files`, `WinGet Links`, etc.), nunca o
+caminho pessoal completo.
+
+
+## Workspace Explorer — v2.26.0
+A raiz operacional padrão é `D:\python\CHATGPT` e não é gravada como
+preferência. O antigo `git_projects.json` é removido e caminhos Git
+selecionados passam a existir apenas em memória durante a sessão.
+O Workspace não exclui nem renomeia pastas físicas.

@@ -63,3 +63,12 @@ Desktop.ini
 $RECYCLE.BIN/
 .vscode/
 .idea/
+
+# Sessões / credenciais / bancos de navegador
+cookies*
+session*
+sessions/
+credentials*
+auth*
+*.sqlite-wal
+*.sqlite-shm

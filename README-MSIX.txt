@@ -256,3 +256,156 @@ Arquivos privados como PFX, PEM e KEY nunca são oferecidos para Release.
 
 O GitHub CLI continua sendo usado com a sessão já autenticada:
     gh auth status
+
+
+COMANDOS INDIVIDUAIS GIT - v2.24.2
+-----------------------------------
+A área GIT & GITHUB agora possui um painel de comandos isolados.
+
+Comandos disponibilizados:
+- git status
+- git init
+- git clone
+- git add
+- git commit
+- git switch
+- git branch (listar / criar / excluir)
+- git fetch origin
+- git pull --rebase
+- git push
+- git log
+- git diff
+- git remote -v
+- git rm -r --cached
+
+Proteções:
+- não existe terminal/shell arbitrário no Dashboard;
+- Add, Commit e Push passam pela auditoria de vazamentos;
+- clone rejeita URLs HTTPS com credenciais/tokens embutidos;
+- pull --rebase com conflito é abortado automaticamente;
+- exclusão de branch exige confirmação;
+- remoção de arquivos usa --cached, preservando os arquivos locais;
+- comandos destrutivos como reset --hard não são expostos.
+
+Versão MSIX:
+    2.24.2.0
+
+
+GERENCIADOR DE REPOSITÓRIOS GITHUB - v2.25.0
+----------------------------------------------
+A área GIT & GITHUB agora lista e administra os repositórios da conta
+autenticada pelo GitHub CLI.
+
+Inclui:
+- total/públicos/privados/locais/arquivados/forks;
+- busca, filtros e ordenação;
+- abrir no GitHub e copiar URL;
+- detectar clone local conhecido pelo Hub;
+- selecionar clone local como projeto ativo;
+- clonar repositório;
+- criar repositório público/privado e opcionalmente clonar;
+- editar descrição, homepage, visibilidade, Issues, Projects, Wiki e
+  branch padrão;
+- arquivar/restaurar;
+- renomear com confirmação e atualização automática do origin local
+  quando possível;
+- exclusão permanente com dupla confirmação.
+
+Segurança:
+- não armazena token GitHub;
+- usa a sessão do gh auth;
+- mudança para público exige confirmação explícita;
+- rename/delete exigem o nome completo owner/repo;
+- delete pode exigir o escopo delete_repo no GitHub CLI.
+
+Versão MSIX:
+    2.25.0.0
+
+
+POLÍTICA ZERO-CREDENCIAIS - v2.25.1
+------------------------------------
+O TECH TOOL HUB não armazena:
+- senhas;
+- tokens;
+- cookies;
+- sessões;
+- chaves de acesso;
+- links pessoais persistentes;
+- credenciais embutidas em URLs.
+
+Acesso a apps e sites:
+- o Hub apenas abre a URL/aplicativo;
+- login/autenticação pertencem ao navegador/site/aplicativo;
+- se não houver sessão ativa, o próprio serviço solicitará login.
+
+Links:
+- links adicionados manualmente são temporários, apenas em memória;
+- links_data.json deixou de ser usado e é removido no startup;
+- leitura/importação de favoritos do navegador foi desativada;
+- os links temporários desaparecem ao encerrar o processo.
+
+Git/GitHub:
+- autenticação usa somente a sessão externa do Git/GitHub CLI;
+- nenhum token GitHub é persistido pelo Hub;
+- saídas apresentadas no frontend passam por mascaramento de tokens;
+- APIs operacionais usam Cache-Control: no-store.
+
+Versão MSIX:
+    2.25.1.0
+
+
+CORREÇÃO DE DETECÇÃO DO GITHUB CLI - v2.25.2
+----------------------------------------------
+O TECH TOOL HUB não depende mais somente do PATH do processo para
+encontrar o GitHub CLI.
+
+No Windows, a detecção procura nesta ordem:
+1. PATH do processo;
+2. Program Files\GitHub CLI\gh.exe;
+3. LocalAppData\Programs\GitHub CLI\gh.exe;
+4. LocalAppData\Microsoft\WinGet\Links\gh.exe;
+5. pacotes do WinGet em LocalAppData\Microsoft\WinGet\Packages.
+
+Motivo:
+um EXE/MSIX pode ter um PATH diferente do PowerShell, especialmente
+quando o GitHub CLI foi instalado depois que o aplicativo já estava
+aberto.
+
+O caminho completo de gh.exe NÃO é persistido nem enviado ao frontend.
+O Dashboard mostra somente a origem genérica da detecção.
+
+Diagnóstico:
+    gh --version
+    gh auth status
+    where.exe gh
+    Get-Command gh | Select-Object Source
+
+Versão MSIX:
+    2.25.2.0
+
+
+WORKSPACE EXPLORER - v2.26.0
+-----------------------------
+O Workspace agora lista as pastas reais de D:\python\CHATGPT em uma
+interface inspirada no Explorer do Windows.
+
+Inclui:
+- busca instantânea;
+- filtros por Em andamento, Pausado, Concluído, Sem cadastro e Git;
+- colunas Nome, Status, Progresso, Git e Modificado;
+- abrir pasta no Explorer;
+- abrir Terminal na pasta;
+- selecionar pasta no painel Git & GitHub;
+- cadastrar uma pasta ainda sem metadados no Hub;
+- abrir o dashboard existente para projeto já cadastrado.
+
+O vínculo com o cadastro é pelo nome da pasta/projeto.
+Excluir o cadastro no Hub não apaga a pasta física.
+O Workspace não oferece exclusão nem renomeação de diretórios.
+
+Privacidade:
+- a raiz operacional não é persistida como preferência;
+- git_projects.json legado é removido;
+- caminhos Git selecionados ficam somente na memória da sessão.
+
+Versão MSIX: 2.26.0.0

@@ -82,11 +82,29 @@ CATALOG_MIGRATION_FILE = APP_DATA_DIR / ".apps_catalog_v1_done"
 OFFICIAL_ICONS_MIGRATION_FILE = APP_DATA_DIR / ".official_icons_v1_done"
 GIT_PROJECTS_FILE = APP_DATA_DIR / "git_projects.json"
 
+# Workspace Explorer: raiz operacional padrão solicitada.
+# Não é persistida como preferência do usuário.
+WORKSPACE_DEFAULT_ROOT = Path(r"D:\\python\\CHATGPT")
+WORKSPACE_EXCLUDED_FOLDERS = {
+    ".git", ".idea", ".vscode", "__pycache__",
+    "node_modules", "venv", ".venv",
+}
+
+# Caminhos selecionados no Git & GitHub ficam somente na sessão atual.
+SESSION_GIT_PROJECTS_STATE: dict[str, Any] = {
+    "selected_path": "",
+    "projects": [],
+}
+
 # A marca é recurso do aplicativo e permanece somente leitura no MSIX.
 BRAND_IMAGE_FILE = RESOURCE_DIR / "brand_logo.png"
 
 DATA_LOCK = threading.RLock()
 LINKS_LOCK = threading.RLock()
+
+# Política de segurança v2.25.1:
+# links adicionados pelo usuário existem somente durante a sessão atual.
+SESSION_LINKS: list[dict[str, Any]] = []
 LOCAL_APPS_LOCK = threading.RLock()
 PROJECTS_LOCK = threading.RLock()
 USER_PROFILE_LOCK = threading.RLock()
@@ -130,8 +148,30 @@ ALLOWED_ICON_TYPES = {
 app = FastAPI(
     title=APP_TITLE,
     description="Hub local para centralização e gerenciamento de ferramentas.",
-    version="2.24.1",
+    version="2.26.0",
 )
+
+
+@app.middleware("http")
+async def security_no_store_middleware(request: Request, call_next):
+    """Impede cache de respostas operacionais/sensíveis."""
+    response = await call_next(request)
+
+    sensitive_prefixes = (
+        "/api/github/",
+        "/api/git-dashboard/",
+        "/api/links",
+        "/api/user-profile",
+        "/api/security-policy",
+        "/api/workspace/explorer",
+    )
+
+    if request.url.path.startswith(sensitive_prefixes):
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+
+    return response
 
 
 # ============================================================
@@ -521,6 +561,123 @@ RELEASE_PRIVATE_SUFFIXES = {
 }
 
 
+
+def _find_github_cli() -> tuple[str, str]:
+    """
+    Localiza gh.exe sem depender apenas do PATH do processo.
+
+    Isso é importante no MSIX/EXE, porque o aplicativo pode ter sido aberto
+    antes da instalação do GitHub CLI ou pode receber um PATH diferente do
+    PowerShell/Explorer.
+    """
+    found = shutil.which("gh")
+    if found:
+        return found, "PATH"
+
+    if os.name != "nt":
+        return "", ""
+
+    candidate_specs: list[tuple[Path, str]] = []
+
+    def add_candidate(raw: str | None, suffix: str, source: str) -> None:
+        if not raw:
+            return
+        candidate_specs.append((Path(raw) / suffix, source))
+
+    add_candidate(
+        os.environ.get("ProgramFiles"),
+        r"GitHub CLI\gh.exe",
+        "Program Files",
+    )
+    add_candidate(
+        os.environ.get("ProgramW6432"),
+        r"GitHub CLI\gh.exe",
+        "Program Files",
+    )
+    add_candidate(
+        os.environ.get("ProgramFiles(x86)"),
+        r"GitHub CLI\gh.exe",
+        "Program Files (x86)",
+    )
+    add_candidate(
+        os.environ.get("LOCALAPPDATA"),
+        r"Programs\GitHub CLI\gh.exe",
+        "LocalAppData Programs",
+    )
+    add_candidate(
+        os.environ.get("LOCALAPPDATA"),
+        r"Microsoft\WinGet\Links\gh.exe",
+        "WinGet Links",
+    )
+
+    user_profile = os.environ.get("USERPROFILE")
+    if user_profile:
+        candidate_specs.append((
+            Path(user_profile)
+            / "AppData"
+            / "Local"
+            / "Microsoft"
+            / "WinGet"
+            / "Links"
+            / "gh.exe",
+            "WinGet Links",
+        ))
+
+    seen: set[str] = set()
+
+    for candidate, source in candidate_specs:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        try:
+            if candidate.is_file():
+                return str(candidate), source
+        except OSError:
+            continue
+
+    # Fallback para instalações do WinGet sem link atualizado no PATH.
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        packages_dir = (
+            Path(local_app_data)
+            / "Microsoft"
+            / "WinGet"
+            / "Packages"
+        )
+        try:
+            if packages_dir.is_dir():
+                patterns = (
+                    "GitHub.cli_*",
+                    "GitHub.cli*",
+                )
+                for pattern in patterns:
+                    for package_dir in packages_dir.glob(pattern):
+                        possible_files = [
+                            package_dir / "gh.exe",
+                            package_dir / "bin" / "gh.exe",
+                        ]
+
+                        try:
+                            possible_files.extend(
+                                list(package_dir.glob("**/gh.exe"))[:8]
+                            )
+                        except OSError:
+                            pass
+
+                        for candidate in possible_files:
+                            try:
+                                if candidate.is_file():
+                                    return str(candidate), "WinGet Package"
+                            except OSError:
+                                continue
+        except OSError:
+            pass
+
+    return "", ""
+
+
 def _run_process(
     args: list[str],
     *,
@@ -528,13 +685,20 @@ def _run_process(
     timeout: int = 60,
 ) -> dict[str, Any]:
     """Executa um comando local sem shell e captura saída."""
+    resolved_args = list(args)
+
+    if resolved_args and resolved_args[0].lower() in {"gh", "gh.exe"}:
+        gh_path, _gh_source = _find_github_cli()
+        if gh_path:
+            resolved_args[0] = gh_path
+
     creationflags = 0
     if os.name == "nt":
         creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
     try:
         completed = subprocess.run(
-            args,
+            resolved_args,
             cwd=str(cwd or SOURCE_DIR),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -549,7 +713,7 @@ def _run_process(
         return {
             "ok": False,
             "returncode": 127,
-            "output": f"Comando não encontrado: {args[0]}",
+            "output": f"Comando não encontrado: {resolved_args[0]}",
         }
     except subprocess.TimeoutExpired as exc:
         output = exc.stdout or ""
@@ -624,115 +788,46 @@ def _default_git_projects_state() -> dict[str, Any]:
 
 
 def _load_git_projects_state() -> dict[str, Any]:
+    """Retorna projetos Git apenas da sessão atual."""
     with GIT_PROJECTS_LOCK:
-        state: dict[str, Any] = {}
-
-        if GIT_PROJECTS_FILE.is_file():
-            try:
-                loaded = json.loads(
-                    GIT_PROJECTS_FILE.read_text(
-                        encoding="utf-8-sig"
-                    )
-                )
-                if isinstance(loaded, dict):
-                    state = loaded
-            except (OSError, json.JSONDecodeError):
-                state = {}
-
-        if not state:
-            state = _default_git_projects_state()
-
-        raw_projects = state.get("projects", [])
-        clean_projects: list[dict[str, str]] = []
-        seen: set[str] = set()
-
-        if isinstance(raw_projects, list):
-            for item in raw_projects:
-                if not isinstance(item, dict):
-                    continue
-
-                candidate = _clean_project_path(
-                    str(item.get("path", ""))
-                )
-                if candidate is None:
-                    continue
-
-                normalized = str(candidate)
-                key = normalized.lower() if os.name == "nt" else normalized
-
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                clean_projects.append({
-                    "path": normalized,
-                    "name": str(
-                        item.get("name") or candidate.name
-                    ).strip() or candidate.name,
-                })
-
-        selected = _clean_project_path(
-            str(state.get("selected_path", ""))
-        )
-
-        if selected is None and clean_projects:
-            selected = Path(clean_projects[0]["path"])
-
-        if selected is None:
-            default_state = _default_git_projects_state()
-            default_selected = _clean_project_path(
-                str(default_state.get("selected_path", ""))
-            )
-            if default_selected is not None:
-                selected = default_selected
-                if not any(
-                    item["path"].lower() == str(selected).lower()
-                    if os.name == "nt"
-                    else item["path"] == str(selected)
-                    for item in clean_projects
-                ):
-                    clean_projects.insert(
-                        0,
-                        {
-                            "path": str(selected),
-                            "name": selected.name,
-                        },
-                    )
-
-        normalized_state = {
-            "selected_path": str(selected) if selected else "",
-            "projects": clean_projects[:30],
+        return {
+            "selected_path": str(SESSION_GIT_PROJECTS_STATE.get("selected_path", "")).strip(),
+            "projects": [
+                {
+                    "path": str(item.get("path", "")).strip(),
+                    "name": str(item.get("name", "")).strip(),
+                }
+                for item in SESSION_GIT_PROJECTS_STATE.get("projects", [])
+                if isinstance(item, dict) and str(item.get("path", "")).strip()
+            ][:30],
         }
 
-        try:
-            GIT_PROJECTS_FILE.write_text(
-                json.dumps(
-                    normalized_state,
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
-
-        return normalized_state
 
 
 def _save_git_projects_state(state: dict[str, Any]) -> None:
+    """Mantém o seletor Git apenas em memória; não grava caminhos locais."""
+    global SESSION_GIT_PROJECTS_STATE
     with GIT_PROJECTS_LOCK:
-        GIT_PROJECTS_FILE.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-        GIT_PROJECTS_FILE.write_text(
-            json.dumps(
-                state,
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        SESSION_GIT_PROJECTS_STATE = {
+            "selected_path": str(state.get("selected_path", "")).strip(),
+            "projects": [
+                {
+                    "path": str(item.get("path", "")).strip(),
+                    "name": str(item.get("name", "")).strip(),
+                }
+                for item in state.get("projects", [])
+                if isinstance(item, dict) and str(item.get("path", "")).strip()
+            ][:30],
+        }
+
+
+def purge_legacy_git_project_paths() -> None:
+    """Remove o arquivo legado que persistia caminhos locais de projetos Git."""
+    try:
+        GIT_PROJECTS_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
 
 
 def _remember_git_project(
@@ -1307,7 +1402,7 @@ def git_github_environment() -> dict[str, Any]:
                             ahead = 0
                             behind = 0
 
-    gh_path = shutil.which("gh")
+    gh_path, gh_detection_source = _find_github_cli()
     gh_installed = bool(gh_path)
     gh_authenticated = False
     gh_auth_message = "GitHub CLI não encontrado."
@@ -1339,7 +1434,7 @@ def git_github_environment() -> dict[str, Any]:
         "projects": project_state["projects"],
         "repo_root": str(repo_root) if repo_root else "",
         "branch": branch,
-        "remote": remote,
+        "remote": redact_sensitive_text(remote),
         "changed_files": len(status_lines),
         "status_lines": status_lines[:30],
         "last_commit": last_commit,
@@ -1348,6 +1443,7 @@ def git_github_environment() -> dict[str, Any]:
         "behind": behind,
         "git_installed": bool(shutil.which("git")),
         "gh_installed": gh_installed,
+        "gh_detection_source": gh_detection_source,
         "gh_authenticated": gh_authenticated,
         "gh_auth_message": gh_auth_message,
         "release_assets": project_release_assets(repo_root),
@@ -1430,7 +1526,7 @@ def publish_project_to_github(
     )
     logs.append("$ git add -A")
     if add_result["output"]:
-        logs.append(add_result["output"])
+        logs.append(redact_sensitive_text(add_result["output"]))
 
     if not add_result["ok"]:
         raise HTTPException(
@@ -1479,7 +1575,7 @@ def publish_project_to_github(
             f"$ git commit -m {commit_message.strip()!r}"
         )
         if commit_result["output"]:
-            logs.append(commit_result["output"])
+            logs.append(redact_sensitive_text(commit_result["output"]))
 
         if not commit_result["ok"]:
             raise HTTPException(
@@ -1603,7 +1699,7 @@ def publish_project_to_github(
         f"$ git push -u origin {branch}"
     )
     if push_result["output"]:
-        logs.append(push_result["output"])
+        logs.append(redact_sensitive_text(push_result["output"]))
 
     if not push_result["ok"]:
         raise HTTPException(
@@ -1662,6 +1758,1421 @@ def _validated_release_asset(
         )
 
     return candidate
+
+
+
+
+GITHUB_REPO_ACTIONS = {
+    "clone",
+    "select_local",
+    "archive",
+    "unarchive",
+    "rename",
+    "delete",
+}
+
+
+def _require_github_cli() -> None:
+    gh_path, _gh_source = _find_github_cli()
+
+    if not gh_path:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "GitHub CLI (gh) não foi localizado. "
+                "Confirme no PowerShell com: gh --version. "
+                "Se funcionar, reinicie o TECH TOOL HUB."
+            ),
+        )
+
+    auth = _run_process(
+        ["gh", "auth", "status"],
+        cwd=_selected_project_path() or SOURCE_DIR,
+        timeout=30,
+    )
+    if not auth["ok"]:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                "GitHub CLI não está autenticado. "
+                "Execute no PowerShell: gh auth login"
+            ),
+        )
+
+
+def _validate_github_repo_slug(repo: str) -> str:
+    value = repo.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Identificador de repositório GitHub inválido.",
+        )
+    return value
+
+
+def _validate_github_repo_name(name: str) -> str:
+    value = name.strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", value) or value in {".", ".."}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "O nome do repositório pode conter apenas letras, números, "
+                "ponto, hífen e sublinhado."
+            ),
+        )
+    return value
+
+
+def _github_current_login() -> str:
+    _require_github_cli()
+    result = _run_process(
+        ["gh", "api", "user", "--jq", ".login"],
+        cwd=_selected_project_path() or SOURCE_DIR,
+        timeout=30,
+    )
+    if not result["ok"] or not result["output"].strip():
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=result["output"] or "Não foi possível identificar a conta GitHub.",
+        )
+    return result["output"].strip()
+
+
+def _github_slug_from_remote(remote: str) -> str:
+    value = remote.strip()
+    patterns = [
+        r"^https?://github\.com/([^/]+)/([^/?#]+?)(?:\.git)?/?$",
+        r"^git@github\.com:([^/]+)/(.+?)(?:\.git)?$",
+        r"^ssh://git@github\.com/([^/]+)/(.+?)(?:\.git)?/?$",
+    ]
+
+    for pattern in patterns:
+        match = re.match(pattern, value, flags=re.IGNORECASE)
+        if not match:
+            continue
+
+        owner = match.group(1).strip()
+        name = match.group(2).strip()
+
+        if name.lower().endswith(".git"):
+            name = name[:-4]
+
+        if owner and name:
+            return f"{owner}/{name}".lower()
+
+    return ""
+
+
+def _github_local_repo_map() -> dict[str, dict[str, Any]]:
+    """Mapeia owner/repo para clones locais conhecidos pelo Hub."""
+    mapping: dict[str, dict[str, Any]] = {}
+    state = _load_git_projects_state()
+    selected = _selected_project_path()
+    paths: list[Path] = []
+
+    for item in state.get("projects", []):
+        path = _clean_project_path(str(item.get("path", "")))
+        if path is not None:
+            paths.append(path)
+
+    if selected is not None:
+        paths.append(selected)
+
+    seen: set[str] = set()
+
+    for path in paths:
+        repo_root = _repo_root_from_path(path)
+        if repo_root is None:
+            continue
+
+        key = str(repo_root).lower() if os.name == "nt" else str(repo_root)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        remote = _git_output(["remote", "get-url", "origin"], repo_root=repo_root)
+        slug = _github_slug_from_remote(remote)
+        if not slug:
+            continue
+
+        branch = _git_output(["branch", "--show-current"], repo_root=repo_root)
+        changes = [
+            line
+            for line in _git_output(["status", "--porcelain"], repo_root=repo_root).splitlines()
+            if line.strip()
+        ]
+
+        mapping[slug] = {
+            "path": str(repo_root),
+            "branch": branch.strip(),
+            "changed_files": len(changes),
+            "selected": (
+                str(repo_root).lower() == str(selected).lower()
+                if os.name == "nt" and selected
+                else repo_root == selected
+            ),
+        }
+
+    return mapping
+
+
+def _github_api_json(
+    endpoint: str,
+    *,
+    method: str = "GET",
+    fields: list[tuple[str, str, bool]] | None = None,
+    timeout: int = 90,
+) -> Any:
+    """Executa GitHub API via gh; typed=True usa -F."""
+    _require_github_cli()
+
+    args = ["gh", "api", "--method", method.upper(), endpoint]
+
+    for key, value, typed in fields or []:
+        args.extend(["-F" if typed else "-f", f"{key}={value}"])
+
+    result = _run_process(
+        args,
+        cwd=_selected_project_path() or SOURCE_DIR,
+        timeout=timeout,
+    )
+
+    if not result["ok"]:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=result["output"] or f"GitHub API falhou em {endpoint}.",
+        )
+
+    try:
+        return json.loads(result["output"]) if result["output"] else {}
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Resposta inválida do GitHub: {exc}",
+        ) from exc
+
+
+def list_github_repositories(scope: str = "owner") -> dict[str, Any]:
+    """Lista repositórios e associa clones locais conhecidos."""
+    _require_github_cli()
+
+    normalized_scope = scope.strip().lower()
+    if normalized_scope not in {"owner", "all"}:
+        normalized_scope = "owner"
+
+    login = _github_current_login()
+    affiliation = (
+        "owner"
+        if normalized_scope == "owner"
+        else "owner,collaborator,organization_member"
+    )
+
+    repositories: list[dict[str, Any]] = []
+
+    for page in range(1, 6):
+        endpoint = (
+            "user/repos"
+            f"?per_page=100&page={page}"
+            "&sort=updated&direction=desc"
+            f"&affiliation={affiliation}"
+        )
+        page_data = _github_api_json(endpoint)
+
+        if not isinstance(page_data, list):
+            break
+
+        repositories.extend(page_data)
+
+        if len(page_data) < 100:
+            break
+
+    local_map = _github_local_repo_map()
+    items: list[dict[str, Any]] = []
+
+    for repo in repositories:
+        full_name = str(repo.get("full_name") or "")
+        local = local_map.get(full_name.lower())
+
+        permissions = repo.get("permissions")
+        if not isinstance(permissions, dict):
+            permissions = {}
+
+        owner_data = repo.get("owner")
+        owner_login = (
+            str(owner_data.get("login") or "")
+            if isinstance(owner_data, dict)
+            else ""
+        )
+
+        visibility = str(repo.get("visibility") or "")
+        if not visibility:
+            visibility = "private" if repo.get("private") else "public"
+
+        items.append({
+            "id": repo.get("id"),
+            "name": str(repo.get("name") or ""),
+            "full_name": full_name,
+            "owner": owner_login,
+            "description": str(repo.get("description") or ""),
+            "url": str(repo.get("html_url") or ""),
+            "clone_url": str(repo.get("clone_url") or ""),
+            "ssh_url": str(repo.get("ssh_url") or ""),
+            "homepage": str(repo.get("homepage") or ""),
+            "visibility": visibility,
+            "private": bool(repo.get("private")),
+            "archived": bool(repo.get("archived")),
+            "fork": bool(repo.get("fork")),
+            "template": bool(repo.get("is_template")),
+            "default_branch": str(repo.get("default_branch") or ""),
+            "language": str(repo.get("language") or ""),
+            "stars": int(repo.get("stargazers_count") or 0),
+            "forks": int(repo.get("forks_count") or 0),
+            "open_issues": int(repo.get("open_issues_count") or 0),
+            "size_kb": int(repo.get("size") or 0),
+            "updated_at": str(repo.get("updated_at") or ""),
+            "pushed_at": str(repo.get("pushed_at") or ""),
+            "has_issues": bool(repo.get("has_issues", True)),
+            "has_projects": bool(repo.get("has_projects", True)),
+            "has_wiki": bool(repo.get("has_wiki", True)),
+            "can_admin": bool(
+                permissions.get("admin")
+                or owner_login.lower() == login.lower()
+            ),
+            "can_push": bool(
+                permissions.get("push")
+                or permissions.get("maintain")
+                or permissions.get("admin")
+                or owner_login.lower() == login.lower()
+            ),
+            "local": local or None,
+        })
+
+    summary = {
+        "total": len(items),
+        "public": sum(1 for item in items if item["visibility"] == "public"),
+        "private": sum(1 for item in items if item["visibility"] == "private"),
+        "archived": sum(1 for item in items if item["archived"]),
+        "forks": sum(1 for item in items if item["fork"]),
+        "local": sum(1 for item in items if item["local"]),
+    }
+
+    return {
+        "login": login,
+        "scope": normalized_scope,
+        "summary": summary,
+        "repositories": items,
+    }
+
+
+def get_github_repository(repo: str) -> dict[str, Any]:
+    slug = _validate_github_repo_slug(repo)
+    data = _github_api_json(f"repos/{slug}")
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Resposta inválida ao consultar o repositório.",
+        )
+    return data
+
+
+def create_github_repository(payload: GitHubRepoCreateRequest) -> dict[str, Any]:
+    _require_github_cli()
+
+    name = _validate_github_repo_name(payload.name)
+    login = _github_current_login()
+
+    repo_data = _github_api_json(
+        "user/repos",
+        method="POST",
+        fields=[
+            ("name", name, False),
+            ("description", payload.description.strip(), False),
+            ("private", "true" if payload.visibility == "private" else "false", True),
+            ("auto_init", "true" if payload.add_readme else "false", True),
+        ],
+        timeout=120,
+    )
+
+    full_name = str(repo_data.get("full_name") or f"{login}/{name}")
+    cloned_path = ""
+
+    if payload.clone_after:
+        parent = _clean_project_path(payload.parent_path)
+        if parent is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "Repositório criado, mas a pasta do clone é inválida. "
+                    f"Repositório: {full_name}"
+                ),
+            )
+
+        destination = parent / name
+        if destination.exists():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Repositório criado no GitHub, mas a pasta local "
+                    f"já existe: {destination}"
+                ),
+            )
+
+        clone_result = _run_process(
+            ["gh", "repo", "clone", full_name, name],
+            cwd=parent,
+            timeout=600,
+        )
+        if not clone_result["ok"]:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=(
+                    f"Repositório {full_name} criado, mas o clone falhou:\n"
+                    f"{clone_result['output']}"
+                ),
+            )
+
+        repo_root = _repo_root_from_path(destination)
+        if repo_root:
+            _remember_git_project(repo_root, activate=True)
+            cloned_path = str(repo_root)
+
+    return {
+        "message": f"Repositório {full_name} criado com sucesso.",
+        "repo": full_name,
+        "url": str(repo_data.get("html_url") or ""),
+        "cloned_path": cloned_path,
+    }
+
+
+def edit_github_repository(payload: GitHubRepoEditRequest) -> dict[str, Any]:
+    slug = _validate_github_repo_slug(payload.repo)
+    current = get_github_repository(slug)
+
+    current_visibility = str(
+        current.get("visibility")
+        or ("private" if current.get("private") else "public")
+    )
+
+    if (
+        payload.visibility == "public"
+        and current_visibility != "public"
+        and not payload.confirm_public
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Tornar um repositório público expõe o código. "
+                "Confirmação explícita é necessária."
+            ),
+        )
+
+    fields: list[tuple[str, str, bool]] = [
+        ("description", payload.description.strip(), False),
+        ("homepage", payload.homepage.strip(), False),
+        ("visibility", payload.visibility, False),
+        ("has_issues", "true" if payload.has_issues else "false", True),
+        ("has_projects", "true" if payload.has_projects else "false", True),
+        ("has_wiki", "true" if payload.has_wiki else "false", True),
+    ]
+
+    if payload.default_branch.strip():
+        fields.append(("default_branch", payload.default_branch.strip(), False))
+
+    updated = _github_api_json(
+        f"repos/{slug}",
+        method="PATCH",
+        fields=fields,
+        timeout=90,
+    )
+
+    return {
+        "message": f"{slug} atualizado com sucesso.",
+        "repo": str(updated.get("full_name") or slug),
+        "url": str(updated.get("html_url") or ""),
+    }
+
+
+def _github_clone_repository(
+    slug: str,
+    parent_path: str,
+    folder_name: str,
+) -> dict[str, Any]:
+    _require_github_cli()
+    repo = _validate_github_repo_slug(slug)
+
+    parent = _clean_project_path(parent_path)
+    if parent is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Selecione uma pasta-pai válida para o clone.",
+        )
+
+    target_name = (
+        _validate_clone_folder_name(folder_name)
+        if folder_name.strip()
+        else repo.split("/", 1)[1]
+    )
+    destination = parent / target_name
+
+    if destination.exists():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A pasta de destino já existe: {destination}",
+        )
+
+    result = _run_process(
+        ["gh", "repo", "clone", repo, target_name],
+        cwd=parent,
+        timeout=600,
+    )
+    if not result["ok"]:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=result["output"] or "Clone falhou.",
+        )
+
+    repo_root = _repo_root_from_path(destination)
+    if repo_root is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Clone concluído, mas o repositório local não foi identificado.",
+        )
+
+    remembered = _remember_git_project(repo_root, activate=True)
+
+    return {
+        "message": f"{repo} clonado e selecionado como projeto ativo.",
+        "repo": repo,
+        "path": str(repo_root),
+        "selected_path": remembered.get("selected_path", ""),
+    }
+
+
+def manage_github_repository(payload: GitHubRepoActionRequest) -> dict[str, Any]:
+    _require_github_cli()
+
+    repo = _validate_github_repo_slug(payload.repo)
+    action = payload.action.strip().lower()
+
+    if action not in GITHUB_REPO_ACTIONS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Ação de repositório GitHub não permitida.",
+        )
+
+    local_map = _github_local_repo_map()
+    local = local_map.get(repo.lower())
+
+    if action == "clone":
+        return _github_clone_repository(
+            repo,
+            payload.parent_path,
+            payload.folder_name,
+        )
+
+    if action == "select_local":
+        if not local:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Nenhum clone local conhecido para este repositório.",
+            )
+
+        path = _clean_project_path(str(local.get("path") or ""))
+        if path is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="A pasta local não está mais disponível.",
+            )
+
+        state = _remember_git_project(path, activate=True)
+        return {
+            "message": f"{repo} selecionado como projeto ativo.",
+            "repo": repo,
+            "path": str(path),
+            "selected_path": state.get("selected_path", ""),
+        }
+
+    if action in {"archive", "unarchive"}:
+        archived = action == "archive"
+        updated = _github_api_json(
+            f"repos/{repo}",
+            method="PATCH",
+            fields=[
+                ("archived", "true" if archived else "false", True),
+            ],
+            timeout=90,
+        )
+        return {
+            "message": f"{repo} {'arquivado' if archived else 'restaurado'}.",
+            "repo": str(updated.get("full_name") or repo),
+            "url": str(updated.get("html_url") or ""),
+        }
+
+    if action == "rename":
+        new_name = _validate_github_repo_name(payload.new_name)
+
+        if payload.confirmation.strip() != repo:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Para renomear, confirme digitando exatamente "
+                    f"{repo}."
+                ),
+            )
+
+        updated = _github_api_json(
+            f"repos/{repo}",
+            method="PATCH",
+            fields=[("name", new_name, False)],
+            timeout=90,
+        )
+
+        new_full_name = str(
+            updated.get("full_name")
+            or f"{repo.split('/', 1)[0]}/{new_name}"
+        )
+        local_remote_updated = False
+
+        if local:
+            local_path = _clean_project_path(str(local.get("path") or ""))
+            repo_root = (
+                _repo_root_from_path(local_path)
+                if local_path is not None
+                else None
+            )
+            if repo_root is not None:
+                old_remote = _git_output(
+                    ["remote", "get-url", "origin"],
+                    repo_root=repo_root,
+                )
+                if (
+                    old_remote
+                    and _github_slug_from_remote(old_remote) == repo.lower()
+                ):
+                    if old_remote.startswith("git@"):
+                        new_remote = f"git@github.com:{new_full_name}.git"
+                    elif old_remote.startswith("ssh://"):
+                        new_remote = f"ssh://git@github.com/{new_full_name}.git"
+                    else:
+                        new_remote = f"https://github.com/{new_full_name}.git"
+
+                    set_remote = _run_process(
+                        ["git", "remote", "set-url", "origin", new_remote],
+                        cwd=repo_root,
+                        timeout=30,
+                    )
+                    local_remote_updated = set_remote["ok"]
+
+        return {
+            "message": f"{repo} renomeado para {new_full_name}.",
+            "repo": new_full_name,
+            "url": str(updated.get("html_url") or ""),
+            "local_remote_updated": local_remote_updated,
+        }
+
+    if action == "delete":
+        if payload.confirmation.strip() != repo:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Exclusão permanente bloqueada. "
+                    f"Digite exatamente {repo} para confirmar."
+                ),
+            )
+
+        result = _run_process(
+            ["gh", "repo", "delete", repo, "--yes"],
+            cwd=_selected_project_path() or SOURCE_DIR,
+            timeout=120,
+        )
+        if not result["ok"]:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=(
+                    result["output"]
+                    or (
+                        "Não foi possível excluir. A conta pode precisar "
+                        "da permissão delete_repo no GitHub CLI."
+                    )
+                ),
+            )
+
+        return {
+            "message": f"{repo} excluído permanentemente do GitHub.",
+            "repo": repo,
+        }
+
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail="Ação não implementada.",
+    )
+
+
+GIT_INDIVIDUAL_ACTIONS = {
+    "status",
+    "init",
+    "clone",
+    "add",
+    "commit",
+    "switch",
+    "branches",
+    "branch_create",
+    "branch_delete",
+    "fetch",
+    "pull_rebase",
+    "push",
+    "log",
+    "diff",
+    "remote",
+    "rm_cached",
+}
+
+
+def _git_command_display(args: list[str]) -> str:
+    """Forma legível do comando sem usar shell."""
+    def quote_arg(value: str) -> str:
+        if not value:
+            return '""'
+        if re.search(r"[\s\"']", value):
+            return '"' + value.replace('"', '\\"') + '"'
+        return value
+
+    return " ".join(quote_arg(str(item)) for item in args)
+
+
+def _require_selected_project() -> Path:
+    selected = _selected_project_path()
+    if selected is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Nenhuma pasta de projeto está selecionada.",
+        )
+    return selected
+
+
+def _require_selected_repo() -> Path:
+    selected = _require_selected_project()
+    repo_root = _repo_root_from_path(selected)
+    if repo_root is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "A pasta selecionada ainda não é um repositório Git. "
+                "Use o comando Init ou selecione outro projeto."
+            ),
+        )
+    return repo_root
+
+
+def _validate_git_branch_name(
+    repo_root: Path,
+    branch: str,
+) -> str:
+    branch = branch.strip()
+
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Informe o nome da branch.",
+        )
+
+    result = _run_process(
+        ["git", "check-ref-format", "--branch", branch],
+        cwd=repo_root,
+        timeout=15,
+    )
+
+    if not result["ok"]:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Nome de branch inválido: {branch}",
+        )
+
+    return branch
+
+
+def _validate_clone_url(raw_url: str) -> str:
+    clone_url = raw_url.strip()
+
+    if not clone_url:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Informe a URL do repositório.",
+        )
+
+    # HTTPS sem credencial embutida.
+    if clone_url.startswith("https://"):
+        parsed = urlparse(clone_url)
+        if (
+            not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "Use uma URL HTTPS limpa, sem usuário, senha, token, "
+                    "query string ou fragmento."
+                ),
+            )
+        return clone_url
+
+    # SSH tradicional do GitHub/GitLab etc.
+    if re.fullmatch(
+        r"git@[A-Za-z0-9._-]+:[A-Za-z0-9._/-]+(?:\.git)?",
+        clone_url,
+    ):
+        return clone_url
+
+    if clone_url.startswith("ssh://"):
+        parsed = urlparse(clone_url)
+        if not parsed.hostname or parsed.password:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="URL SSH inválida.",
+            )
+        return clone_url
+
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail=(
+            "Use uma URL HTTPS ou SSH de Git válida. "
+            "Tokens embutidos na URL não são aceitos."
+        ),
+    )
+
+
+def _validate_clone_folder_name(
+    raw_name: str,
+) -> str:
+    folder_name = raw_name.strip()
+
+    if not folder_name:
+        return ""
+
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", folder_name):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "O nome da pasta do clone pode conter apenas letras, "
+                "números, ponto, hífen e sublinhado."
+            ),
+        )
+
+    if folder_name in {".", ".."}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Nome de pasta inválido.",
+        )
+
+    return folder_name
+
+
+def _git_command_result(
+    action: str,
+    args: list[str],
+    result: dict[str, Any],
+    *,
+    cwd: Path,
+    message: str = "",
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": bool(result.get("ok")),
+        "action": action,
+        "command": redact_sensitive_text(_git_command_display(args)),
+        "cwd": str(cwd),
+        "returncode": int(result.get("returncode", 1)),
+        "output": redact_sensitive_text(str(result.get("output", ""))),
+        "message": redact_sensitive_text(message),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def execute_individual_git_command(
+    payload: GitCommandRequest,
+) -> dict[str, Any]:
+    """Executa somente comandos Git previamente autorizados."""
+    if not shutil.which("git"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Git não foi encontrado no PATH.",
+        )
+
+    action = payload.action.strip().lower()
+
+    if action not in GIT_INDIVIDUAL_ACTIONS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Comando Git não permitido pelo Dashboard.",
+        )
+
+    # --------------------------------------------------------
+    # INIT: permitido em pasta selecionada ainda sem .git.
+    # --------------------------------------------------------
+    if action == "init":
+        selected = _require_selected_project()
+        existing_repo = _repo_root_from_path(selected)
+
+        if existing_repo is not None:
+            result = _run_process(
+                ["git", "status", "--short", "--branch"],
+                cwd=existing_repo,
+                timeout=30,
+            )
+            return _git_command_result(
+                action,
+                ["git", "status", "--short", "--branch"],
+                result,
+                cwd=existing_repo,
+                message="A pasta já é um repositório Git.",
+                extra={"repo_root": str(existing_repo)},
+            )
+
+        args = ["git", "init", "-b", "main"]
+        result = _run_process(args, cwd=selected, timeout=60)
+
+        if not result["ok"]:
+            # Compatibilidade com versões antigas do Git.
+            args = ["git", "init"]
+            result = _run_process(args, cwd=selected, timeout=60)
+            if result["ok"]:
+                branch_result = _run_process(
+                    ["git", "branch", "-M", "main"],
+                    cwd=selected,
+                    timeout=30,
+                )
+                if branch_result["output"]:
+                    result["output"] = (
+                        result["output"]
+                        + "\n"
+                        + branch_result["output"]
+                    ).strip()
+
+        if not result["ok"]:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=result["output"] or "git init falhou.",
+            )
+
+        remembered = _remember_git_project(
+            selected,
+            activate=True,
+        )
+        repo_root = _repo_root_from_path(selected) or selected
+
+        return _git_command_result(
+            action,
+            args,
+            result,
+            cwd=selected,
+            message="Repositório Git inicializado.",
+            extra={
+                "repo_root": str(repo_root),
+                "selected_project_changed": True,
+                "selected_path": remembered.get("selected_path", ""),
+            },
+        )
+
+    # --------------------------------------------------------
+    # CLONE: destino escolhido separadamente.
+    # --------------------------------------------------------
+    if action == "clone":
+        clone_url = _validate_clone_url(payload.value)
+        folder_name = _validate_clone_folder_name(
+            payload.folder_name
+        )
+
+        parent = _clean_project_path(payload.parent_path)
+        if parent is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "Selecione uma pasta-pai existente para receber o clone."
+                ),
+            )
+
+        if folder_name:
+            destination = parent / folder_name
+            if destination.exists():
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"A pasta de destino já existe: {destination}"
+                    ),
+                )
+            args = [
+                "git",
+                "clone",
+                clone_url,
+                folder_name,
+            ]
+        else:
+            destination = None
+            args = [
+                "git",
+                "clone",
+                clone_url,
+            ]
+
+        result = _run_process(
+            args,
+            cwd=parent,
+            timeout=600,
+        )
+
+        if not result["ok"]:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=result["output"] or "git clone falhou.",
+            )
+
+        if destination is None:
+            repo_name = clone_url.rstrip("/").split("/")[-1]
+            if ":" in repo_name and clone_url.startswith("git@"):
+                repo_name = repo_name.split(":")[-1]
+            if repo_name.lower().endswith(".git"):
+                repo_name = repo_name[:-4]
+            destination = parent / repo_name
+
+        repo_root = _repo_root_from_path(destination)
+        if repo_root is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "O clone terminou, mas o repositório de destino "
+                    "não pôde ser identificado."
+                ),
+            )
+
+        remembered = _remember_git_project(
+            repo_root,
+            activate=True,
+        )
+
+        return _git_command_result(
+            action,
+            args,
+            result,
+            cwd=parent,
+            message="Repositório clonado e ativado.",
+            extra={
+                "repo_root": str(repo_root),
+                "selected_project_changed": True,
+                "selected_path": remembered.get("selected_path", ""),
+            },
+        )
+
+    # A partir daqui é obrigatório um repositório existente.
+    repo_root = _require_selected_repo()
+
+    # --------------------------------------------------------
+    # Comandos somente de leitura.
+    # --------------------------------------------------------
+    read_commands: dict[str, list[str]] = {
+        "status": ["git", "status", "--short", "--branch"],
+        "branches": ["git", "branch", "-vv", "--all"],
+        "log": [
+            "git",
+            "log",
+            "--oneline",
+            "--decorate",
+            "--graph",
+            "-n",
+            "30",
+        ],
+        "remote": ["git", "remote", "-v"],
+    }
+
+    if action in read_commands:
+        args = read_commands[action]
+        result = _run_process(
+            args,
+            cwd=repo_root,
+            timeout=60,
+        )
+        if not result["ok"]:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=result["output"] or f"{action} falhou.",
+            )
+        return _git_command_result(
+            action,
+            args,
+            result,
+            cwd=repo_root,
+        )
+
+    if action == "diff":
+        worktree = _run_process(
+            ["git", "diff", "--stat"],
+            cwd=repo_root,
+            timeout=60,
+        )
+        staged = _run_process(
+            ["git", "diff", "--cached", "--stat"],
+            cwd=repo_root,
+            timeout=60,
+        )
+
+        output_parts = [
+            "=== WORKTREE ===",
+            worktree["output"] or "(sem alterações não staged)",
+            "",
+            "=== STAGED ===",
+            staged["output"] or "(sem alterações staged)",
+        ]
+
+        result = {
+            "ok": worktree["ok"] and staged["ok"],
+            "returncode": 0 if worktree["ok"] and staged["ok"] else 1,
+            "output": "\n".join(output_parts),
+        }
+        return _git_command_result(
+            action,
+            ["git", "diff", "--stat", "+", "git", "diff", "--cached", "--stat"],
+            result,
+            cwd=repo_root,
+        )
+
+    # --------------------------------------------------------
+    # Auditoria em ações que podem publicar/registrar arquivos.
+    # --------------------------------------------------------
+    if action in {"add", "commit", "push"}:
+        audit = run_git_security_audit(repo_root)
+        if audit["blocking_count"] > 0:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Comando bloqueado: a auditoria encontrou "
+                    f"{audit['blocking_count']} risco(s) alto(s)."
+                ),
+            )
+
+    if action == "add":
+        pathspec = payload.value.strip()
+
+        if pathspec:
+            args = ["git", "add", "--", pathspec]
+        else:
+            args = ["git", "add", "-A"]
+
+        result = _run_process(
+            args,
+            cwd=repo_root,
+            timeout=120,
+        )
+        if not result["ok"]:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=result["output"] or "git add falhou.",
+            )
+
+        return _git_command_result(
+            action,
+            args,
+            result,
+            cwd=repo_root,
+            message="Arquivos adicionados ao staging.",
+        )
+
+    if action == "rm_cached":
+        pathspec = payload.value.strip()
+
+        if not pathspec:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Informe o arquivo ou pasta a remover do índice.",
+            )
+
+        args = [
+            "git",
+            "rm",
+            "-r",
+            "--cached",
+            "--",
+            pathspec,
+        ]
+        result = _run_process(
+            args,
+            cwd=repo_root,
+            timeout=120,
+        )
+
+        if not result["ok"]:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=result["output"] or "git rm --cached falhou.",
+            )
+
+        return _git_command_result(
+            action,
+            args,
+            result,
+            cwd=repo_root,
+            message=(
+                "Item removido do índice Git. "
+                "O arquivo local foi preservado."
+            ),
+        )
+
+    if action == "commit":
+        message = payload.message.strip()
+
+        if not message:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Informe a mensagem do commit.",
+            )
+
+        args = [
+            "git",
+            "commit",
+            "-m",
+            message,
+        ]
+        result = _run_process(
+            args,
+            cwd=repo_root,
+            timeout=180,
+        )
+
+        if not result["ok"]:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=result["output"] or "git commit falhou.",
+            )
+
+        return _git_command_result(
+            action,
+            args,
+            result,
+            cwd=repo_root,
+            message="Commit criado.",
+        )
+
+    if action in {"switch", "branch_create", "branch_delete"}:
+        branch = _validate_git_branch_name(
+            repo_root,
+            payload.value,
+        )
+
+        if action == "switch":
+            args = (
+                ["git", "switch", "-c", branch]
+                if payload.create
+                else ["git", "switch", branch]
+            )
+        elif action == "branch_create":
+            args = ["git", "branch", branch]
+        else:
+            current_branch = _git_output(
+                ["branch", "--show-current"],
+                repo_root=repo_root,
+            ).strip()
+
+            if branch == current_branch:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "Não é possível excluir a branch atualmente ativa. "
+                        "Faça switch para outra branch primeiro."
+                    ),
+                )
+
+            args = [
+                "git",
+                "branch",
+                "-D" if payload.force else "-d",
+                branch,
+            ]
+
+        result = _run_process(
+            args,
+            cwd=repo_root,
+            timeout=120,
+        )
+
+        if not result["ok"]:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=result["output"] or f"git {action} falhou.",
+            )
+
+        messages = {
+            "switch": "Branch alterada.",
+            "branch_create": "Branch criada.",
+            "branch_delete": "Branch excluída localmente.",
+        }
+
+        return _git_command_result(
+            action,
+            args,
+            result,
+            cwd=repo_root,
+            message=messages[action],
+        )
+
+    if action == "fetch":
+        if not _git_output(
+            ["remote", "get-url", "origin"],
+            repo_root=repo_root,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="O remote 'origin' não está configurado.",
+            )
+
+        args = ["git", "fetch", "origin"]
+        result = _run_process(
+            args,
+            cwd=repo_root,
+            timeout=240,
+        )
+
+        if not result["ok"]:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=result["output"] or "git fetch origin falhou.",
+            )
+
+        return _git_command_result(
+            action,
+            args,
+            result,
+            cwd=repo_root,
+            message="Referências remotas atualizadas.",
+        )
+
+    if action == "pull_rebase":
+        branch = _git_output(
+            ["branch", "--show-current"],
+            repo_root=repo_root,
+        ).strip()
+
+        if not branch:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="HEAD destacado: selecione uma branch antes do pull.",
+            )
+
+        args = [
+            "git",
+            "pull",
+            "--rebase",
+            "origin",
+            branch,
+        ]
+        result = _run_process(
+            args,
+            cwd=repo_root,
+            timeout=300,
+        )
+
+        if not result["ok"]:
+            conflicts = _run_process(
+                [
+                    "git",
+                    "diff",
+                    "--name-only",
+                    "--diff-filter=U",
+                ],
+                cwd=repo_root,
+                timeout=30,
+            )
+            conflict_files = [
+                line.strip()
+                for line in conflicts["output"].splitlines()
+                if line.strip()
+            ]
+
+            # O painel usa modo conservador: não deixa o repo preso em rebase.
+            _run_process(
+                ["git", "rebase", "--abort"],
+                cwd=repo_root,
+                timeout=30,
+            )
+
+            detail = (
+                result["output"]
+                or "git pull --rebase falhou."
+            )
+            if conflict_files:
+                detail += (
+                    "\nRebase abortado automaticamente. "
+                    "Conflitos: "
+                    + ", ".join(conflict_files[:20])
+                )
+
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=detail,
+            )
+
+        return _git_command_result(
+            action,
+            args,
+            result,
+            cwd=repo_root,
+            message="Pull --rebase concluído.",
+        )
+
+    if action == "push":
+        branch = _git_output(
+            ["branch", "--show-current"],
+            repo_root=repo_root,
+        ).strip()
+
+        if not branch:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="HEAD destacado: selecione uma branch antes do push.",
+            )
+
+        if not _git_output(
+            ["remote", "get-url", "origin"],
+            repo_root=repo_root,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="O remote 'origin' não está configurado.",
+            )
+
+        args = [
+            "git",
+            "push",
+            "-u",
+            "origin",
+            branch,
+        ]
+        result = _run_process(
+            args,
+            cwd=repo_root,
+            timeout=300,
+        )
+
+        if not result["ok"]:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=result["output"] or "git push falhou.",
+            )
+
+        return _git_command_result(
+            action,
+            args,
+            result,
+            cwd=repo_root,
+            message="Push concluído.",
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail="Ação Git não implementada.",
+    )
 
 
 def create_github_release(
@@ -1842,7 +3353,7 @@ def create_github_release(
             else ""
         ),
         "draft": payload.draft,
-        "output": result["output"],
+        "output": redact_sensitive_text(result["output"]),
     }
 
 
@@ -2207,7 +3718,6 @@ def migrate_legacy_user_data() -> None:
 
     legacy_files = [
         "apps_data.json",
-        "links_data.json",
         "local_apps_data.json",
         "projects_data.json",
         "user_profile.json",
@@ -3329,8 +4839,53 @@ class GitProjectPathRequest(BaseModel):
     path: str = Field(..., min_length=1, max_length=1200)
 
 
+class WorkspaceFolderActionRequest(BaseModel):
+    folder_name: str = Field(..., min_length=1, max_length=260)
+    action: str = Field(..., pattern="^(open|terminal|git)$")
+
+
 class GitPublishRequest(BaseModel):
     commit_message: str = Field(..., min_length=1, max_length=160)
+
+
+class GitCommandRequest(BaseModel):
+    action: str = Field(..., min_length=1, max_length=40)
+    value: str = Field(default="", max_length=1600)
+    message: str = Field(default="", max_length=240)
+    create: bool = False
+    force: bool = False
+    parent_path: str = Field(default="", max_length=1600)
+    folder_name: str = Field(default="", max_length=180)
+
+
+class GitHubRepoCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    description: str = Field(default="", max_length=350)
+    visibility: str = Field(default="private", pattern="^(public|private)$")
+    add_readme: bool = True
+    clone_after: bool = False
+    parent_path: str = Field(default="", max_length=1600)
+
+
+class GitHubRepoEditRequest(BaseModel):
+    repo: str = Field(..., min_length=3, max_length=220)
+    description: str = Field(default="", max_length=350)
+    homepage: str = Field(default="", max_length=500)
+    visibility: str = Field(default="private", pattern="^(public|private|internal)$")
+    has_issues: bool = True
+    has_projects: bool = True
+    has_wiki: bool = True
+    default_branch: str = Field(default="", max_length=200)
+    confirm_public: bool = False
+
+
+class GitHubRepoActionRequest(BaseModel):
+    repo: str = Field(..., min_length=3, max_length=220)
+    action: str = Field(..., min_length=1, max_length=40)
+    parent_path: str = Field(default="", max_length=1600)
+    folder_name: str = Field(default="", max_length=180)
+    new_name: str = Field(default="", max_length=100)
+    confirmation: str = Field(default="", max_length=220)
 
 
 class GitReleaseRequest(BaseModel):
@@ -3562,6 +5117,66 @@ def model_to_dict(model: BaseModel) -> dict[str, Any]:
     if hasattr(model, "model_dump"):
         return model.model_dump()
     return model.dict()
+
+
+
+SENSITIVE_OUTPUT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"),
+        "[REDACTED_GITHUB_TOKEN]",
+    ),
+    (
+        re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+        "[REDACTED_GITHUB_TOKEN]",
+    ),
+    (
+        re.compile(r"\b(?:sk|rk)-[A-Za-z0-9_-]{16,}\b"),
+        "[REDACTED_TOKEN]",
+    ),
+    (
+        re.compile(r"(?i)(Authorization\s*:\s*(?:Bearer|Basic)\s+)[^\s]+"),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(r"(?i)(https?://)([^/@\s:]+):([^/@\s]+)@"),
+        r"\1[REDACTED]@",
+    ),
+]
+
+
+def redact_sensitive_text(value: str) -> str:
+    """Mascara tokens/credenciais antes de devolver texto ao frontend."""
+    sanitized = str(value or "")
+    for pattern, replacement in SENSITIVE_OUTPUT_PATTERNS:
+        sanitized = pattern.sub(replacement, sanitized)
+    return sanitized
+
+
+def security_policy_payload() -> dict[str, Any]:
+    """Política explícita de segurança do TECH TOOL HUB."""
+    return {
+        "zero_credentials": True,
+        "stores_passwords": False,
+        "stores_tokens": False,
+        "stores_cookies": False,
+        "stores_sessions": False,
+        "stores_personal_links": False,
+        "browser_authentication": "external",
+        "message": (
+            "O TECH TOOL HUB não armazena credenciais, tokens, cookies, "
+            "sessões nem links pessoais. O acesso a sites e aplicativos "
+            "depende da sessão existente no navegador ou no próprio aplicativo."
+        ),
+    }
+
+
+def purge_legacy_personal_links_storage() -> None:
+    """Remove o antigo links_data.json; a versão atual não usa esse arquivo."""
+    try:
+        LINKS_FILE.unlink(missing_ok=True)
+    except OSError:
+        # Mesmo se não for possível remover, a versão atual não lê o arquivo.
+        pass
 
 
 def validate_http_url(url: str) -> str:
@@ -4059,6 +5674,240 @@ def browser_bookmarks_status() -> list[dict[str, Any]]:
     return output
 
 
+def _workspace_explorer_root() -> Path:
+    """Raiz do Workspace; não é salva como preferência."""
+    if os.name == "nt":
+        try:
+            if WORKSPACE_DEFAULT_ROOT.is_dir():
+                return WORKSPACE_DEFAULT_ROOT.resolve()
+        except OSError:
+            pass
+
+    fallback = SOURCE_DIR.parent
+    try:
+        return fallback.resolve()
+    except OSError:
+        return fallback
+
+
+def _workspace_direct_child(folder_name: str) -> Path:
+    clean_name = str(folder_name or "").strip()
+
+    if (
+        not clean_name
+        or clean_name in {".", ".."}
+        or "/" in clean_name
+        or "\\" in clean_name
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Nome de pasta inválido.",
+        )
+
+    root = _workspace_explorer_root().resolve()
+    candidate = (root / clean_name).resolve()
+
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Pasta fora da raiz do Workspace.",
+        ) from exc
+
+    if not candidate.is_dir() or candidate.parent != root:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pasta do projeto não encontrada.",
+        )
+
+    return candidate
+
+
+def _workspace_project_progress(project: dict[str, Any]) -> int:
+    phases = [
+        phase
+        for phase in project.get("phases", [])
+        if isinstance(phase, dict)
+    ]
+
+    if not phases:
+        return 100 if project.get("status") == "concluido" else 0
+
+    values: list[int] = []
+    for phase in phases:
+        try:
+            value = int(phase.get("progress", 0))
+        except (TypeError, ValueError):
+            value = 0
+        values.append(max(0, min(100, value)))
+
+    return round(sum(values) / len(values)) if values else 0
+
+
+def _workspace_folder_item_count(path: Path) -> int:
+    try:
+        return sum(1 for _ in path.iterdir())
+    except OSError:
+        return 0
+
+
+def workspace_explorer_snapshot() -> dict[str, Any]:
+    """Lista os diretórios reais da raiz como projetos estilo Explorer."""
+    root = _workspace_explorer_root()
+
+    with PROJECTS_LOCK:
+        projects = read_projects()
+
+    by_name = {
+        str(project.get("name", "")).strip().casefold(): project
+        for project in projects
+        if isinstance(project, dict)
+        and str(project.get("name", "")).strip()
+    }
+
+    try:
+        children = sorted(
+            (
+                child
+                for child in root.iterdir()
+                if child.is_dir()
+                and child.name not in WORKSPACE_EXCLUDED_FOLDERS
+                and not child.name.startswith(".")
+            ),
+            key=lambda item: item.name.casefold(),
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Não foi possível ler a pasta do Workspace: {exc}",
+        ) from exc
+
+    items: list[dict[str, Any]] = []
+
+    for folder in children:
+        project = by_name.get(folder.name.casefold())
+        try:
+            modified_ts = float(folder.stat().st_mtime)
+        except OSError:
+            modified_ts = 0.0
+
+        repo_root = _repo_root_from_path(folder)
+
+        items.append({
+            "name": folder.name,
+            "modified_ts": modified_ts,
+            "item_count": _workspace_folder_item_count(folder),
+            "is_git": repo_root is not None,
+            "registered": project is not None,
+            "project_id": int(project.get("id")) if project and str(project.get("id", "")).isdigit() else None,
+            "status": str(project.get("status") or "em_andamento") if project else "nao_classificado",
+            "progress": _workspace_project_progress(project) if project else 0,
+            "client": str(project.get("client") or "") if project else "",
+        })
+
+    summary = {
+        "total": len(items),
+        "em_andamento": sum(1 for item in items if item["status"] == "em_andamento"),
+        "pausado": sum(1 for item in items if item["status"] == "pausado"),
+        "concluido": sum(1 for item in items if item["status"] == "concluido"),
+        "nao_classificado": sum(1 for item in items if item["status"] == "nao_classificado"),
+        "git": sum(1 for item in items if item["is_git"]),
+    }
+
+    return {
+        "root": str(root),
+        "items": items,
+        "summary": summary,
+        "security": {
+            "root_persisted": False,
+            "git_paths_persisted": False,
+        },
+    }
+
+
+def workspace_folder_action(payload: WorkspaceFolderActionRequest) -> dict[str, Any]:
+    folder = _workspace_direct_child(payload.folder_name)
+
+    if payload.action == "open":
+        if os.name != "nt":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Abrir no Explorer está disponível no Windows.",
+            )
+
+        try:
+            subprocess.Popen(
+                ["explorer.exe", str(folder)],
+                cwd=str(folder),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Não foi possível abrir a pasta: {exc}",
+            ) from exc
+
+        return {
+            "message": f"Pasta {folder.name} aberta no Explorer.",
+            "folder_name": folder.name,
+        }
+
+    if payload.action == "terminal":
+        if os.name != "nt":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Terminal do Workspace está disponível no Windows.",
+            )
+
+        terminal = shutil.which("wt.exe")
+        powershell = shutil.which("powershell.exe") or shutil.which("pwsh.exe")
+
+        try:
+            if terminal:
+                subprocess.Popen(
+                    [terminal, "-d", str(folder)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            elif powershell:
+                subprocess.Popen(
+                    [powershell, "-NoExit"],
+                    cwd=str(folder),
+                )
+            else:
+                raise OSError("Windows Terminal/PowerShell não encontrado.")
+        except OSError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Não foi possível abrir o terminal: {exc}",
+            ) from exc
+
+        return {
+            "message": f"Terminal aberto em {folder.name}.",
+            "folder_name": folder.name,
+        }
+
+    if payload.action == "git":
+        remembered = _remember_git_project(folder, activate=True)
+        return {
+            "message": (
+                f"{folder.name} selecionado no Git & GitHub."
+                if remembered.get("is_git")
+                else f"{folder.name} selecionado. Use git init se quiser iniciar o repositório."
+            ),
+            "folder_name": folder.name,
+            "is_git": bool(remembered.get("is_git")),
+            "navigate_to": "/git-github",
+        }
+
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail="Ação do Workspace não suportada.",
+    )
+
+
 def default_project_phases() -> list[dict[str, Any]]:
     """Fases genéricas iniciais para um projeto novo ou legado."""
     names = ["Planejamento", "Execução", "Validação", "Entrega"]
@@ -4279,58 +6128,32 @@ def project_resource_exists(
 
 
 def write_links(links: list[dict[str, Any]]) -> None:
-    """Grava links_data.json de forma atômica."""
-    temp_file = LINKS_FILE.with_suffix(".tmp")
-
-    try:
-        with temp_file.open("w", encoding="utf-8") as file:
-            json.dump(links, file, ensure_ascii=False, indent=2)
-
-        os.replace(temp_file, LINKS_FILE)
-    except OSError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Não foi possível gravar links_data.json: {exc}",
-        ) from exc
+    """Mantém os links somente na memória da sessão atual."""
+    global SESSION_LINKS
+    SESSION_LINKS = [
+        dict(item)
+        for item in links
+        if isinstance(item, dict)
+    ]
 
 
 def ensure_links_file() -> None:
-    """Cria o banco local de favoritos na primeira execução."""
-    if not LINKS_FILE.exists():
-        write_links([])
+    """Compatibilidade: nenhum arquivo de links é criado."""
+    return
 
 
 def read_links() -> list[dict[str, Any]]:
-    """Lê os links favoritos armazenados localmente."""
-    ensure_links_file()
-
-    try:
-        with LINKS_FILE.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-
-        if not isinstance(data, list):
-            raise ValueError("O conteúdo raiz de links_data.json precisa ser uma lista.")
-
-        return data
-
-    except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"O arquivo links_data.json está inválido: {exc.msg}",
-        ) from exc
-    except OSError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Não foi possível ler links_data.json: {exc}",
-        ) from exc
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(exc),
-        ) from exc
+    """Retorna uma cópia dos links temporários da sessão."""
+    return [
+        dict(item)
+        for item in SESSION_LINKS
+        if isinstance(item, dict)
+    ]
 
 
 migrate_legacy_user_data()
+purge_legacy_personal_links_storage()
+purge_legacy_git_project_paths()
 
 ICONS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -6659,8 +8482,8 @@ LINKS_HTML = r"""
                         <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[10px] text-slate-500">▼</span>
                     </div>
 
-                    <button id="importBrowserLinksBtn" type="button" class="h-10 rounded-xl border border-slate-700/30 bg-[#0b2232]/85 px-4 text-sm font-bold text-slate-300 transition hover:border-cyan-300/30 hover:text-cyan-200">
-                        ⇩ Importar navegador
+                    <button id="importBrowserLinksBtn" type="button" disabled class="hidden">
+                        Importação desativada
                     </button>
 
                     <button id="openLinkModalBtn" type="button" class="h-10 rounded-xl border border-cyan-300/20 bg-cyan-400/10 px-4 text-sm font-bold text-cyan-200 transition hover:border-cyan-300/40 hover:bg-cyan-400/15">
@@ -6673,10 +8496,10 @@ LINKS_HTML = r"""
         <main class="mx-auto max-w-[1350px] px-4 py-6 sm:px-6 xl:px-8">
             <section class="mb-5 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
                 <div>
-                    <p class="text-xs font-semibold uppercase tracking-[.18em] text-cyan-400/65">Biblioteca pessoal</p>
-                    <h2 class="mt-1 text-2xl font-bold tracking-tight text-slate-100">Meus links favoritos</h2>
+                    <p class="text-xs font-semibold uppercase tracking-[.18em] text-cyan-400/65">Sessão temporária</p>
+                    <h2 class="mt-1 text-2xl font-bold tracking-tight text-slate-100">Links temporários</h2>
                     <p class="mt-1 max-w-2xl text-sm text-slate-500">
-                        Guarde vídeos, imagens, filmes, livros, tecnologia, aplicativos, dicas e qualquer conteúdo que queira reencontrar rapidamente.
+                        Os links adicionados aqui ficam somente na memória enquanto o TECH TOOL HUB estiver aberto. Nada é salvo em disco.
                     </p>
                 </div>
 
@@ -6686,12 +8509,19 @@ LINKS_HTML = r"""
                 </div>
             </section>
 
+            <section class="mb-5 rounded-2xl border border-emerald-400/20 bg-emerald-400/[.035] px-5 py-4">
+                <div class="text-sm font-bold text-emerald-200">🔒 Política zero-credenciais</div>
+                <div class="mt-1 text-xs leading-5 text-slate-500">
+                    O Hub não armazena senhas, tokens, cookies, sessões ou links pessoais. Ao abrir um site, a autenticação depende exclusivamente da sessão existente no navegador/site.
+                </div>
+            </section>
+
             <section id="linkDropZone" class="mb-5 rounded-2xl border border-dashed border-cyan-400/20 bg-cyan-400/[.035] px-5 py-5 transition">
                 <div class="flex flex-col items-center justify-center gap-2 text-center sm:flex-row sm:text-left">
                     <div class="grid h-11 w-11 shrink-0 place-items-center rounded-xl border border-cyan-400/15 bg-cyan-400/5 text-xl text-cyan-300">↧</div>
                     <div class="min-w-0">
-                        <div class="text-sm font-semibold text-slate-300">Arraste um link aqui para cadastrar</div>
-                        <div class="mt-0.5 text-xs text-slate-600">Arraste uma URL, favorito ou link do navegador. O formulário será aberto com os dados detectados.</div>
+                        <div class="text-sm font-semibold text-slate-300">Arraste um link aqui para usar nesta sessão</div>
+                        <div class="mt-0.5 text-xs text-slate-600">O atalho fica somente na memória e desaparece quando o Hub for encerrado.</div>
                     </div>
                 </div>
             </section>
@@ -6703,7 +8533,7 @@ LINKS_HTML = r"""
             <div id="linksEmpty" class="hidden rounded-2xl border border-dashed border-slate-700/30 bg-[#081a27]/60 px-6 py-16 text-center">
                 <div class="text-4xl">★</div>
                 <p class="mt-3 text-sm font-semibold text-slate-300">Nenhum link encontrado.</p>
-                <p class="mt-1 text-xs text-slate-600">Use “Adicionar Link” para começar sua biblioteca.</p>
+                <p class="mt-1 text-xs text-slate-600">Use “Adicionar Link” para criar um atalho temporário nesta sessão.</p>
             </div>
         </main>
     </div>
@@ -6713,8 +8543,8 @@ LINKS_HTML = r"""
         <div class="w-full max-w-xl rounded-2xl border border-slate-700/30 bg-[#091d2a] p-6 shadow-2xl">
             <div class="mb-5 flex items-start justify-between gap-4">
                 <div>
-                    <h3 class="text-xl font-bold text-slate-100">Importar favoritos dos navegadores</h3>
-                    <p class="mt-1 text-xs text-slate-500">Selecione os navegadores. URLs já cadastradas serão ignoradas.</p>
+                    <h3 class="text-xl font-bold text-slate-100">Importação desativada</h3>
+                    <p class="mt-1 text-xs text-slate-500">A política de segurança impede leitura e armazenamento de favoritos pessoais do navegador.</p>
                 </div>
                 <button id="closeBrowserImportModalBtn" type="button" class="rounded-lg p-2 text-slate-500 hover:bg-slate-800/40 hover:text-slate-200">✕</button>
             </div>
@@ -8821,6 +10651,73 @@ WORKSPACE_HTML = r"""
             background: linear-gradient(145deg, rgba(13,35,50,.93), rgba(8,25,37,.96));
         }
 
+        .explorer-shell {
+            border: 1px solid rgba(129,180,204,.13);
+            background: linear-gradient(180deg, rgba(11,31,44,.96), rgba(7,24,36,.96));
+        }
+
+        .explorer-nav-item {
+            transition: background .14s ease, color .14s ease, border-color .14s ease;
+        }
+
+        .explorer-nav-item:hover,
+        .explorer-nav-item.active {
+            background: rgba(35,135,162,.13);
+            color: #bff7ff;
+            border-color: rgba(53,213,230,.17);
+        }
+
+        .explorer-row {
+            border-bottom: 1px solid rgba(129,180,204,.08);
+            transition: background .12s ease, box-shadow .12s ease;
+        }
+
+        .explorer-row:hover { background: rgba(34,93,119,.11); }
+        .explorer-row.selected {
+            background: rgba(28,141,169,.14);
+            box-shadow: inset 3px 0 rgba(53,213,230,.75);
+        }
+
+        .explorer-col-title {
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .08em;
+            color: rgb(71 85 105);
+        }
+
+        .folder-icon {
+            position: relative;
+            width: 28px;
+            height: 20px;
+            border-radius: 4px 5px 5px 5px;
+            background: linear-gradient(180deg, #e4b44e, #c78a2b);
+            box-shadow: inset 0 -2px rgba(98,58,12,.18);
+        }
+
+        .folder-icon::before {
+            content: '';
+            position: absolute;
+            left: 2px;
+            top: -5px;
+            width: 12px;
+            height: 7px;
+            border-radius: 4px 4px 0 0;
+            background: #efc260;
+        }
+
+        @media (max-width: 767px) {
+            .explorer-table-head { display: none; }
+            .explorer-row {
+                display: block !important;
+                padding: 14px;
+                border: 1px solid rgba(129,180,204,.10);
+                border-radius: 14px;
+                margin-bottom: 8px;
+            }
+            .explorer-hide-mobile { display: none; }
+        }
+
         .project-card {
             border: 1px solid rgba(129,180,204,.12);
             background: rgba(7,27,40,.78);
@@ -8976,16 +10873,57 @@ WORKSPACE_HTML = r"""
 
         <main class="mx-auto max-w-[1500px] px-4 py-6 sm:px-6 xl:px-8">
             <section class="mb-5">
-                <p class="text-xs font-semibold uppercase tracking-[.18em] text-cyan-400/65">Workspace</p>
-                <h2 class="mt-1 text-2xl font-bold tracking-tight text-slate-100">Projetos personalizados</h2>
-                <p class="mt-1 max-w-3xl text-sm text-slate-500">
-                    Crie um projeto, registre cliente e período e arraste Apps ou Links para montar a área de trabalho daquele projeto.
+                <p class="text-xs font-semibold uppercase tracking-[.18em] text-cyan-400/65">Workspace Explorer</p>
+                <h2 class="mt-1 text-2xl font-bold tracking-tight text-slate-100">Projetos em D:\python\CHATGPT</h2>
+                <p class="mt-1 max-w-4xl text-sm text-slate-500">
+                    As pastas reais são a fonte da lista. O cadastro do TECH TOOL HUB adiciona status, fases, progresso e ferramentas sem mover ou renomear seus diretórios.
                 </p>
             </section>
 
-            <div class="grid gap-5 xl:grid-cols-[290px_minmax(0,1fr)]">
+            <section class="explorer-shell mb-5 overflow-hidden rounded-2xl">
+                <div class="border-b border-slate-700/20 px-4 py-3">
+                    <div class="flex flex-col gap-3 lg:flex-row lg:items-center">
+                        <div class="flex min-w-0 flex-1 items-center gap-2">
+                            <button id="workspaceExplorerRefreshBtn" type="button" class="grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-slate-700/25 bg-[#071722] text-slate-400 hover:text-cyan-200" title="Atualizar">↻</button>
+                            <div class="flex min-w-0 flex-1 items-center gap-2 rounded-lg border border-slate-700/25 bg-[#061722] px-3 py-2">
+                                <span class="text-amber-300">📁</span>
+                                <span id="workspaceExplorerRoot" class="truncate font-mono text-[11px] text-slate-400">D:\python\CHATGPT</span>
+                            </div>
+                            <button id="workspaceExplorerNewBtn" class="h-9 shrink-0 rounded-lg border border-cyan-400/15 bg-cyan-400/5 px-3 text-[11px] font-bold text-cyan-300">＋ Cadastro</button>
+                        </div>
+                        <div class="relative w-full lg:w-[330px]">
+                            <span class="pointer-events-none absolute left-3 top-2.5 text-slate-600">⌕</span>
+                            <input id="workspaceExplorerSearch" placeholder="Pesquisar projetos..." class="h-9 w-full rounded-lg border border-slate-700/25 bg-[#061722] pl-8 pr-3 text-xs text-slate-200 outline-none placeholder:text-slate-700 focus:border-cyan-400/30">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="grid min-h-[360px] lg:grid-cols-[210px_minmax(0,1fr)]">
+                    <aside class="border-b border-slate-700/15 bg-[#061722]/60 p-3 lg:border-b-0 lg:border-r">
+                        <div class="mb-2 px-2 text-[9px] font-bold uppercase tracking-[.14em] text-slate-700">Acesso rápido</div>
+                        <button data-workspace-filter="all" class="explorer-nav-item active flex w-full items-center gap-2 rounded-lg border border-transparent px-3 py-2 text-left text-xs text-slate-400"><span>📂</span><span class="flex-1">Todos os projetos</span><span id="workspaceCountAll" class="text-[10px] text-slate-600">0</span></button>
+                        <button data-workspace-filter="em_andamento" class="explorer-nav-item mt-1 flex w-full items-center gap-2 rounded-lg border border-transparent px-3 py-2 text-left text-xs text-slate-400"><span class="h-2 w-2 rounded-full bg-cyan-400"></span><span class="flex-1">Em andamento</span><span id="workspaceCountActive" class="text-[10px] text-slate-600">0</span></button>
+                        <button data-workspace-filter="pausado" class="explorer-nav-item mt-1 flex w-full items-center gap-2 rounded-lg border border-transparent px-3 py-2 text-left text-xs text-slate-400"><span class="h-2 w-2 rounded-full bg-amber-300"></span><span class="flex-1">Pausados</span><span id="workspaceCountPaused" class="text-[10px] text-slate-600">0</span></button>
+                        <button data-workspace-filter="concluido" class="explorer-nav-item mt-1 flex w-full items-center gap-2 rounded-lg border border-transparent px-3 py-2 text-left text-xs text-slate-400"><span class="h-2 w-2 rounded-full bg-emerald-400"></span><span class="flex-1">Concluídos</span><span id="workspaceCountDone" class="text-[10px] text-slate-600">0</span></button>
+                        <button data-workspace-filter="nao_classificado" class="explorer-nav-item mt-1 flex w-full items-center gap-2 rounded-lg border border-transparent px-3 py-2 text-left text-xs text-slate-400"><span class="h-2 w-2 rounded-full bg-slate-600"></span><span class="flex-1">Sem cadastro</span><span id="workspaceCountUnregistered" class="text-[10px] text-slate-600">0</span></button>
+                        <button data-workspace-filter="git" class="explorer-nav-item mt-1 flex w-full items-center gap-2 rounded-lg border border-transparent px-3 py-2 text-left text-xs text-slate-400"><span>⑂</span><span class="flex-1">Repositórios Git</span><span id="workspaceCountGit" class="text-[10px] text-slate-600">0</span></button>
+                        <div class="mt-5 rounded-xl border border-emerald-400/10 bg-emerald-400/[.025] p-3 text-[10px] leading-4 text-slate-600"><strong class="text-emerald-300/80">Privacidade:</strong> a raiz e os caminhos escolhidos no Git ficam somente na sessão.</div>
+                    </aside>
+
+                    <section class="min-w-0">
+                        <div class="explorer-table-head grid grid-cols-[minmax(260px,1.7fr)_150px_110px_90px_150px_130px] border-b border-slate-700/15 bg-[#071722]/50 px-4 py-2">
+                            <div class="explorer-col-title">Nome</div><div class="explorer-col-title">Status</div><div class="explorer-col-title">Progresso</div><div class="explorer-col-title">Git</div><div class="explorer-col-title">Modificado</div><div class="explorer-col-title text-right">Ações</div>
+                        </div>
+                        <div id="workspaceExplorerList" class="max-h-[560px] overflow-y-auto"></div>
+                        <div id="workspaceExplorerEmpty" class="hidden px-5 py-14 text-center"><div class="text-4xl">📂</div><p class="mt-2 text-xs font-semibold text-slate-400">Nenhuma pasta encontrada</p><p class="mt-1 text-[10px] text-slate-600">Verifique o filtro selecionado.</p></div>
+                    </section>
+                </div>
+                <div class="flex flex-wrap items-center justify-between gap-2 border-t border-slate-700/15 bg-[#061722]/55 px-4 py-2"><span id="workspaceExplorerCount" class="text-[10px] text-slate-600">0 projetos</span><span id="workspaceExplorerSelection" class="max-w-full truncate text-[10px] text-slate-600">Nenhum projeto selecionado</span></div>
+            </section>
+
+            <div class="space-y-5">
                 <!-- LISTA DE PROJETOS -->
-                <aside class="panel rounded-2xl p-4">
+                <aside class="hidden">
                     <div class="mb-3 flex items-center justify-between gap-3">
                         <div>
                             <h3 class="text-sm font-bold text-slate-200">Projetos</h3>
@@ -9147,8 +11085,8 @@ WORKSPACE_HTML = r"""
 
                 <section id="projectWelcome" class="panel rounded-2xl px-6 py-20 text-center">
                     <div class="text-5xl">◈</div>
-                    <h3 class="mt-4 text-lg font-bold text-slate-200">Crie ou selecione um projeto</h3>
-                    <p class="mx-auto mt-2 max-w-lg text-sm leading-6 text-slate-600">Depois você poderá arrastar Apps e Links para montar uma área de trabalho personalizada.</p>
+                    <h3 class="mt-4 text-lg font-bold text-slate-200">Selecione uma pasta cadastrada</h3>
+                    <p class="mx-auto mt-2 max-w-xl text-sm leading-6 text-slate-600">Clique em uma pasta com status para abrir o dashboard. Pastas “Sem cadastro” podem ser registradas sem mover ou alterar arquivos.</p>
                 </section>
             </div>
         </main>
@@ -9305,6 +11243,12 @@ WORKSPACE_HTML = r"""
             apps: [],
             localApps: [],
             links: [],
+            workspaceFolders: [],
+            workspaceSummary: {},
+            workspaceRoot: '',
+            workspaceFilter: 'all',
+            workspaceSearch: '',
+            selectedFolderName: '',
             selectedProjectId: null,
             libraryTab: 'app',
             editProjectId: null,
@@ -9314,6 +11258,12 @@ WORKSPACE_HTML = r"""
         const projectsList = document.getElementById('projectsList');
         const projectsEmpty = document.getElementById('projectsEmpty');
         const projectsCount = document.getElementById('projectsCount');
+        const workspaceExplorerList = document.getElementById('workspaceExplorerList');
+        const workspaceExplorerEmpty = document.getElementById('workspaceExplorerEmpty');
+        const workspaceExplorerRoot = document.getElementById('workspaceExplorerRoot');
+        const workspaceExplorerSearch = document.getElementById('workspaceExplorerSearch');
+        const workspaceExplorerCount = document.getElementById('workspaceExplorerCount');
+        const workspaceExplorerSelection = document.getElementById('workspaceExplorerSelection');
         const projectArea = document.getElementById('projectArea');
         const projectWelcome = document.getElementById('projectWelcome');
         const projectTitle = document.getElementById('projectTitle');
@@ -9551,6 +11501,138 @@ WORKSPACE_HTML = r"""
                 url: link.url,
                 icon: linkFavicon(link.url)
             } : null;
+        }
+
+        function workspaceStatusClass(status) {
+            if (status === 'concluido') return 'status-concluido';
+            if (status === 'pausado') return 'status-pausado';
+            if (status === 'cancelado') return 'status-cancelado';
+            if (status === 'planejado') return 'status-planejado';
+            if (status === 'em_andamento') return 'status-em_andamento';
+            return 'border-slate-700/30 bg-slate-800/20 text-slate-500';
+        }
+
+        function formatWorkspaceModified(timestamp) {
+            const numeric = Number(timestamp || 0);
+            if (!numeric) return '—';
+            const date = new Date(numeric * 1000);
+            if (Number.isNaN(date.getTime())) return '—';
+            return date.toLocaleString('pt-BR', {
+                day: '2-digit', month: '2-digit', year: 'numeric',
+                hour: '2-digit', minute: '2-digit'
+            });
+        }
+
+        function projectForFolder(folder) {
+            if (!folder?.project_id) return null;
+            return state.projects.find(
+                project => Number(project.id) === Number(folder.project_id)
+            ) || null;
+        }
+
+        function filteredWorkspaceFolders() {
+            const query = normalize(state.workspaceSearch || '');
+            return state.workspaceFolders.filter(folder => {
+                const filterMatch = state.workspaceFilter === 'all'
+                    || (state.workspaceFilter === 'git'
+                        ? Boolean(folder.is_git)
+                        : folder.status === state.workspaceFilter);
+                if (!filterMatch) return false;
+                if (!query) return true;
+                return normalize([
+                    folder.name,
+                    folder.client,
+                    STATUS_LABELS[folder.status] || folder.status
+                ].join(' ')).includes(query);
+            });
+        }
+
+        function renderWorkspaceExplorer() {
+            const folders = filteredWorkspaceFolders();
+            const summary = state.workspaceSummary || {};
+
+            workspaceExplorerRoot.textContent = state.workspaceRoot || 'D:\\python\\CHATGPT';
+            workspaceExplorerCount.textContent = `${folders.length} exibido(s) • ${state.workspaceFolders.length} total`;
+            workspaceExplorerEmpty.classList.toggle('hidden', folders.length > 0);
+
+            document.getElementById('workspaceCountAll').textContent = summary.total ?? 0;
+            document.getElementById('workspaceCountActive').textContent = summary.em_andamento ?? 0;
+            document.getElementById('workspaceCountPaused').textContent = summary.pausado ?? 0;
+            document.getElementById('workspaceCountDone').textContent = summary.concluido ?? 0;
+            document.getElementById('workspaceCountUnregistered').textContent = summary.nao_classificado ?? 0;
+            document.getElementById('workspaceCountGit').textContent = summary.git ?? 0;
+
+            document.querySelectorAll('[data-workspace-filter]').forEach(button => {
+                button.classList.toggle(
+                    'active',
+                    button.dataset.workspaceFilter === state.workspaceFilter
+                );
+            });
+
+            workspaceExplorerList.innerHTML = folders.map(folder => {
+                const selected = folder.name === state.selectedFolderName;
+                const statusLabel = folder.registered
+                    ? (STATUS_LABELS[folder.status] || folder.status)
+                    : 'Sem cadastro';
+                const progress = Number(folder.progress || 0);
+
+                return `
+                    <div class="explorer-row ${selected ? 'selected' : ''} grid cursor-default grid-cols-[minmax(260px,1.7fr)_150px_110px_90px_150px_130px] items-center px-4 py-2.5" data-workspace-folder="${escapeHtml(folder.name)}" data-project-id="${folder.project_id ? Number(folder.project_id) : ''}">
+                        <div class="flex min-w-0 items-center gap-3 pr-3">
+                            <div class="folder-icon shrink-0"></div>
+                            <div class="min-w-0">
+                                <div class="truncate text-xs font-semibold text-slate-300">${escapeHtml(folder.name)}</div>
+                                <div class="mt-0.5 truncate text-[9px] text-slate-700">${folder.item_count} ${folder.item_count === 1 ? 'item' : 'itens'}${folder.client ? ` • ${escapeHtml(folder.client)}` : ''}</div>
+                            </div>
+                        </div>
+                        <div class="explorer-hide-mobile pr-3"><span class="inline-flex rounded-lg border px-2 py-1 text-[9px] font-bold uppercase tracking-[.06em] ${workspaceStatusClass(folder.status)}">${escapeHtml(statusLabel)}</span></div>
+                        <div class="explorer-hide-mobile pr-3">${folder.registered ? `<div class="text-[10px] font-bold text-cyan-300/80">${progress}%</div><div class="mt-1 h-1 overflow-hidden rounded-full bg-[#061722]"><div class="overall-progress-fill" style="width:${progress}%"></div></div>` : '<span class="text-[10px] text-slate-700">—</span>'}</div>
+                        <div class="explorer-hide-mobile">${folder.is_git ? '<span class="rounded-md border border-violet-400/20 bg-violet-400/5 px-2 py-1 text-[9px] font-bold text-violet-200">⑂ Git</span>' : '<span class="text-[10px] text-slate-700">—</span>'}</div>
+                        <div class="explorer-hide-mobile text-[10px] text-slate-500">${escapeHtml(formatWorkspaceModified(folder.modified_ts))}</div>
+                        <div class="flex items-center justify-end gap-1">
+                            <button data-workspace-action="open" data-folder="${escapeHtml(folder.name)}" class="grid h-7 w-7 place-items-center rounded-md text-[11px] text-slate-500 hover:bg-cyan-400/5 hover:text-cyan-200" title="Abrir no Explorer">📂</button>
+                            <button data-workspace-action="terminal" data-folder="${escapeHtml(folder.name)}" class="grid h-7 w-7 place-items-center rounded-md text-[11px] text-slate-500 hover:bg-cyan-400/5 hover:text-cyan-200" title="Terminal">⌘</button>
+                            <button data-workspace-action="git" data-folder="${escapeHtml(folder.name)}" class="grid h-7 w-7 place-items-center rounded-md text-[11px] text-slate-500 hover:bg-violet-400/5 hover:text-violet-200" title="Git & GitHub">⑂</button>
+                            ${folder.registered
+                                ? `<button data-workspace-action="details" data-folder="${escapeHtml(folder.name)}" data-project-id="${Number(folder.project_id)}" class="grid h-7 w-7 place-items-center rounded-md text-[11px] text-slate-500 hover:bg-emerald-400/5 hover:text-emerald-200" title="Detalhes">◈</button>`
+                                : `<button data-workspace-action="register" data-folder="${escapeHtml(folder.name)}" class="grid h-7 w-7 place-items-center rounded-md text-[11px] text-slate-500 hover:bg-emerald-400/5 hover:text-emerald-200" title="Cadastrar">＋</button>`
+                            }
+                        </div>
+                        <div class="mt-3 flex flex-wrap items-center gap-2 md:hidden"><span class="rounded-lg border px-2 py-1 text-[9px] font-bold uppercase tracking-[.06em] ${workspaceStatusClass(folder.status)}">${escapeHtml(statusLabel)}</span>${folder.is_git ? '<span class="text-[9px] font-bold text-violet-300">⑂ Git</span>' : ''}${folder.registered ? `<span class="text-[9px] font-bold text-cyan-300">${progress}%</span>` : ''}<span class="text-[9px] text-slate-600">${escapeHtml(formatWorkspaceModified(folder.modified_ts))}</span></div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        async function loadWorkspaceExplorer() {
+            const response = await fetch('/api/workspace/explorer', { cache: 'no-store' });
+            const data = await response.json();
+            if (!response.ok) {
+                throw new Error(data.detail || 'Não foi possível ler as pastas do Workspace.');
+            }
+            state.workspaceFolders = Array.isArray(data.items) ? data.items : [];
+            state.workspaceSummary = data.summary || {};
+            state.workspaceRoot = data.root || 'D:\\python\\CHATGPT';
+            if (!state.workspaceFolders.some(folder => folder.name === state.selectedFolderName)) {
+                state.selectedFolderName = '';
+            }
+            renderWorkspaceExplorer();
+        }
+
+        async function runWorkspaceFolderAction(folderName, action) {
+            try {
+                const response = await fetch('/api/workspace/explorer/action', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ folder_name: folderName, action })
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || 'Ação não concluída.');
+                showToast(data.message || 'Ação concluída.');
+                if (action === 'git' && data.navigate_to) window.location.href = data.navigate_to;
+            } catch (error) {
+                showToast(error.message || 'Erro na ação da pasta.', true);
+            }
         }
 
         function renderProjects() {
@@ -9873,6 +11955,7 @@ WORKSPACE_HTML = r"""
 
                 closePhaseModal();
                 renderProjects();
+                renderWorkspaceExplorer();
                 renderSelectedProject();
                 showToast(editing ? 'Fase atualizada.' : 'Fase adicionada.');
             } catch (error) {
@@ -9915,7 +11998,7 @@ WORKSPACE_HTML = r"""
             }
         }
 
-        function openProjectModal(project = null) {
+        function openProjectModal(project = null, suggestedFolderName = '') {
             state.editProjectId = project ? Number(project.id) : null;
             projectForm.reset();
             projectFormError.classList.add('hidden');
@@ -9931,6 +12014,7 @@ WORKSPACE_HTML = r"""
                 projectStatusInput.value = project.status || 'em_andamento';
                 projectNotesInput.value = project.notes || '';
             } else {
+                projectNameInput.value = suggestedFolderName || '';
                 projectStatusInput.value = 'em_andamento';
                 projectStartInput.value = new Date().toISOString().slice(0, 10);
             }
@@ -9950,18 +12034,20 @@ WORKSPACE_HTML = r"""
 
         async function loadWorkspace() {
             try {
-                const [projectsResponse, appsResponse, localAppsResponse, linksResponse] = await Promise.all([
+                const [projectsResponse, appsResponse, localAppsResponse, linksResponse, explorerResponse] = await Promise.all([
                     fetch('/api/projects', { cache: 'no-store' }),
                     fetch('/api/apps', { cache: 'no-store' }),
                     fetch('/api/local-apps', { cache: 'no-store' }),
-                    fetch('/api/links', { cache: 'no-store' })
+                    fetch('/api/links', { cache: 'no-store' }),
+                    fetch('/api/workspace/explorer', { cache: 'no-store' })
                 ]);
 
                 if (
                     !projectsResponse.ok ||
                     !appsResponse.ok ||
                     !localAppsResponse.ok ||
-                    !linksResponse.ok
+                    !linksResponse.ok ||
+                    !explorerResponse.ok
                 ) {
                     throw new Error('Não foi possível carregar os dados da área personalizada.');
                 }
@@ -9970,14 +12056,12 @@ WORKSPACE_HTML = r"""
                 state.apps = await appsResponse.json();
                 state.localApps = await localAppsResponse.json();
                 state.links = await linksResponse.json();
+                const explorerData = await explorerResponse.json();
+                state.workspaceFolders = Array.isArray(explorerData.items) ? explorerData.items : [];
+                state.workspaceSummary = explorerData.summary || {};
+                state.workspaceRoot = explorerData.root || 'D:\\python\\CHATGPT';
                 populateResourceCategoryFilter(true);
 
-                if (
-                    state.selectedProjectId === null &&
-                    state.projects.length
-                ) {
-                    state.selectedProjectId = Number(state.projects[0].id);
-                }
 
                 renderProjects();
                 renderSelectedProject();
@@ -10028,6 +12112,7 @@ WORKSPACE_HTML = r"""
                 }
 
                 closeProjectModal();
+                await loadWorkspaceExplorer();
                 renderProjects();
                 renderSelectedProject();
                 showToast(editing ? 'Projeto atualizado.' : 'Projeto criado.');
@@ -10057,10 +12142,12 @@ WORKSPACE_HTML = r"""
                 }
 
                 state.projects = state.projects.filter(item => Number(item.id) !== Number(project.id));
-                state.selectedProjectId = state.projects.length ? Number(state.projects[0].id) : null;
+                state.selectedProjectId = null;
+                state.selectedFolderName = '';
+                await loadWorkspaceExplorer();
                 renderProjects();
                 renderSelectedProject();
-                showToast('Projeto excluído.');
+                showToast('Cadastro excluído. A pasta física foi preservada.');
             } catch (error) {
                 showToast(error.message || 'Erro ao excluir projeto.', true);
             }
@@ -10246,6 +12333,77 @@ WORKSPACE_HTML = r"""
                 showToast(error.message || 'Erro ao remover ferramenta.', true);
             }
         }
+
+        workspaceExplorerList.addEventListener('click', event => {
+            const actionButton = event.target.closest('[data-workspace-action]');
+            if (actionButton) {
+                event.stopPropagation();
+                const action = actionButton.dataset.workspaceAction;
+                const folderName = actionButton.dataset.folder;
+
+                if (action === 'details') {
+                    state.selectedFolderName = folderName;
+                    state.selectedProjectId = Number(actionButton.dataset.projectId);
+                    workspaceExplorerSelection.textContent = `Selecionado: ${folderName}`;
+                    renderWorkspaceExplorer();
+                    renderProjects();
+                    renderSelectedProject();
+                    projectArea.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    return;
+                }
+
+                if (action === 'register') {
+                    state.selectedFolderName = folderName;
+                    openProjectModal(null, folderName);
+                    return;
+                }
+
+                runWorkspaceFolderAction(folderName, action);
+                return;
+            }
+
+            const row = event.target.closest('[data-workspace-folder]');
+            if (!row) return;
+
+            state.selectedFolderName = row.dataset.workspaceFolder || '';
+            state.selectedProjectId = Number(row.dataset.projectId || 0) || null;
+            workspaceExplorerSelection.textContent = state.selectedFolderName
+                ? `Selecionado: ${state.selectedFolderName}`
+                : 'Nenhum projeto selecionado';
+
+            renderWorkspaceExplorer();
+            renderProjects();
+            renderSelectedProject();
+        });
+
+        workspaceExplorerList.addEventListener('dblclick', event => {
+            if (event.target.closest('button, a')) return;
+            const row = event.target.closest('[data-workspace-folder]');
+            if (row) runWorkspaceFolderAction(row.dataset.workspaceFolder, 'open');
+        });
+
+        document.getElementById('workspaceExplorerRefreshBtn').addEventListener('click', async () => {
+            try {
+                await loadWorkspaceExplorer();
+                showToast('Lista de pastas atualizada.');
+            } catch (error) {
+                showToast(error.message || 'Erro ao atualizar Workspace.', true);
+            }
+        });
+
+        document.getElementById('workspaceExplorerNewBtn').addEventListener('click', () => openProjectModal());
+
+        workspaceExplorerSearch.addEventListener('input', () => {
+            state.workspaceSearch = workspaceExplorerSearch.value;
+            renderWorkspaceExplorer();
+        });
+
+        document.querySelectorAll('[data-workspace-filter]').forEach(button => {
+            button.addEventListener('click', () => {
+                state.workspaceFilter = button.dataset.workspaceFilter;
+                renderWorkspaceExplorer();
+            });
+        });
 
         projectsList.addEventListener('click', event => {
             const button = event.target.closest('[data-project-id]');
@@ -10532,6 +12690,25 @@ GIT_GITHUB_HTML = r"""
             background: rgba(120,53,15,.10);
         }
 
+
+        .repo-card {
+            border: 1px solid rgba(129,180,204,.12);
+            background: linear-gradient(145deg, rgba(7,28,41,.90), rgba(5,20,31,.94));
+            transition: transform .16s ease, border-color .16s ease, background .16s ease;
+        }
+
+        .repo-card:hover {
+            transform: translateY(-1px);
+            border-color: rgba(53,213,230,.22);
+            background: linear-gradient(145deg, rgba(9,34,48,.95), rgba(6,23,34,.97));
+        }
+
+        .modal-shell {
+            background: rgba(1, 9, 15, .76);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+        }
+
         @media (max-width: 1023px) {
             #gitSidebar {
                 transform: translateX(-100%);
@@ -10608,6 +12785,69 @@ GIT_GITHUB_HTML = r"""
                     Audite vazamentos, publique alterações no GitHub e crie releases sem gravar token no TECH TOOL HUB.
                     O acesso ao GitHub usa a autenticação existente do Git/GitHub CLI.
                 </p>
+
+                <div class="mt-3 rounded-xl border border-emerald-400/20 bg-emerald-400/[.035] px-4 py-3 text-xs leading-5 text-slate-500">
+                    <strong class="text-emerald-200">🔒 Zero credenciais:</strong>
+                    o Hub não armazena senhas, tokens, cookies ou sessões. O GitHub usa exclusivamente a sessão já autenticada do <code class="text-slate-300">gh</code>.
+                </div>
+            </section>
+
+
+            <!-- GERENCIADOR DE REPOSITÓRIOS GITHUB -->
+            <section class="panel mb-5 rounded-2xl p-4 sm:p-5">
+                <div class="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+                    <div>
+                        <p class="text-[10px] font-bold uppercase tracking-[.14em] text-cyan-400/60">Conta GitHub</p>
+                        <h3 class="mt-1 text-lg font-bold text-slate-100">Meus repositórios</h3>
+                        <p class="mt-1 max-w-3xl text-xs leading-5 text-slate-500">
+                            Consulte, filtre, clone, edite e administre seus repositórios sem sair do TECH TOOL HUB.
+                            As operações usam sua sessão autenticada do GitHub CLI.
+                        </p>
+                    </div>
+                    <div class="flex flex-wrap gap-2">
+                        <button id="createGithubRepoBtn" class="h-10 rounded-xl border border-emerald-400/20 bg-emerald-400/10 px-4 text-xs font-bold text-emerald-200 hover:bg-emerald-400/15">+ Novo repositório</button>
+                        <button id="refreshGithubReposBtn" class="h-10 rounded-xl border border-cyan-400/20 bg-cyan-400/10 px-4 text-xs font-bold text-cyan-200 hover:bg-cyan-400/15">↻ Atualizar lista</button>
+                    </div>
+                </div>
+
+                <div id="githubRepoAccountMessage" class="mt-3 text-[10px] text-slate-600">Carregando conta...</div>
+
+                <div class="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6">
+                    <div class="status-card rounded-xl p-3 text-center"><div id="repoCountTotal" class="text-xl font-black text-slate-100">—</div><div class="text-[9px] uppercase tracking-[.08em] text-slate-600">Total</div></div>
+                    <div class="status-card rounded-xl p-3 text-center"><div id="repoCountPublic" class="text-xl font-black text-cyan-200">—</div><div class="text-[9px] uppercase tracking-[.08em] text-slate-600">Públicos</div></div>
+                    <div class="status-card rounded-xl p-3 text-center"><div id="repoCountPrivate" class="text-xl font-black text-violet-200">—</div><div class="text-[9px] uppercase tracking-[.08em] text-slate-600">Privados</div></div>
+                    <div class="status-card rounded-xl p-3 text-center"><div id="repoCountLocal" class="text-xl font-black text-emerald-200">—</div><div class="text-[9px] uppercase tracking-[.08em] text-slate-600">No PC</div></div>
+                    <div class="status-card rounded-xl p-3 text-center"><div id="repoCountArchived" class="text-xl font-black text-amber-200">—</div><div class="text-[9px] uppercase tracking-[.08em] text-slate-600">Arquivados</div></div>
+                    <div class="status-card rounded-xl p-3 text-center"><div id="repoCountForks" class="text-xl font-black text-slate-300">—</div><div class="text-[9px] uppercase tracking-[.08em] text-slate-600">Forks</div></div>
+                </div>
+
+                <div class="mt-4 grid gap-2 lg:grid-cols-[minmax(0,1fr)_190px_190px_170px]">
+                    <input id="githubRepoSearchInput" placeholder="Pesquisar por nome, descrição ou linguagem..." class="h-11 rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-sm text-slate-200 outline-none focus:border-cyan-400/35">
+                    <select id="githubRepoVisibilityFilter" class="h-11 rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-xs text-slate-300 outline-none">
+                        <option value="all">Todas visibilidades</option><option value="public">Públicos</option><option value="private">Privados</option><option value="internal">Internos</option>
+                    </select>
+                    <select id="githubRepoStateFilter" class="h-11 rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-xs text-slate-300 outline-none">
+                        <option value="all">Todos estados</option><option value="active">Ativos</option><option value="archived">Arquivados</option><option value="local">Clonados neste PC</option><option value="fork">Forks</option>
+                    </select>
+                    <select id="githubRepoSortSelect" class="h-11 rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-xs text-slate-300 outline-none">
+                        <option value="updated">Mais recentes</option><option value="name">Nome A-Z</option><option value="stars">Mais estrelas</option><option value="size">Maior tamanho</option>
+                    </select>
+                </div>
+
+                <div class="mt-3 flex flex-wrap items-center gap-3 text-[10px] text-slate-600">
+                    <label class="flex items-center gap-2">
+                        <span>Escopo</span>
+                        <select id="githubRepoScopeSelect" class="h-8 rounded-lg border border-slate-700/30 bg-[#061722] px-2 text-[10px] text-slate-300 outline-none">
+                            <option value="owner">Meus repositórios</option>
+                            <option value="all">Todos a que tenho acesso</option>
+                        </select>
+                    </label>
+                    <span id="githubRepoFilteredCount">—</span>
+                </div>
+
+                <div id="githubReposLoading" class="mt-5 hidden rounded-xl border border-slate-700/20 bg-[#061722] p-5 text-center text-xs text-slate-500">Consultando GitHub...</div>
+                <div id="githubReposError" class="mt-5 hidden rounded-xl border border-red-900/40 bg-red-950/20 p-4 text-xs leading-5 text-red-300"></div>
+                <div id="githubRepoGrid" class="mt-5 grid gap-3 md:grid-cols-2 2xl:grid-cols-3"></div>
             </section>
 
             <!-- SELETOR DE PROJETO -->
@@ -10787,6 +13027,157 @@ GIT_GITHUB_HTML = r"""
                 </section>
             </div>
 
+
+            <!-- COMANDOS INDIVIDUAIS GIT -->
+            <section class="panel mt-5 rounded-2xl p-5">
+                <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                    <div>
+                        <div class="text-[10px] font-bold uppercase tracking-[.14em] text-cyan-400/60">Ferramentas avançadas</div>
+                        <h3 class="mt-1 text-lg font-bold text-slate-100">Comandos individuais Git</h3>
+                        <p class="mt-1 max-w-4xl text-xs leading-5 text-slate-500">
+                            Execute operações isoladas no projeto ativo. O Dashboard usa uma lista fechada de comandos:
+                            não executa texto arbitrário no PowerShell e mantém as proteções de vazamento em Add, Commit e Push.
+                        </p>
+                    </div>
+                    <span id="gitIndividualRepoBadge" class="rounded-lg border border-slate-700/25 bg-[#061722] px-3 py-1.5 text-[10px] font-bold uppercase tracking-[.08em] text-slate-500">
+                        aguardando projeto
+                    </span>
+                </div>
+
+                <!-- LEITURA / SINCRONIZAÇÃO -->
+                <div class="mt-5">
+                    <div class="mb-2 text-[10px] font-bold uppercase tracking-[.12em] text-slate-600">Consulta e sincronização</div>
+                    <div class="grid grid-cols-2 gap-2 sm:grid-cols-4 xl:grid-cols-8">
+                        <button data-simple-git-action="status" class="git-repo-command h-10 rounded-xl border border-slate-700/25 bg-[#071c29] px-3 text-[11px] font-bold text-slate-300 hover:border-cyan-400/25 hover:text-cyan-200">Status</button>
+                        <button data-simple-git-action="branches" class="git-repo-command h-10 rounded-xl border border-slate-700/25 bg-[#071c29] px-3 text-[11px] font-bold text-slate-300 hover:border-cyan-400/25 hover:text-cyan-200">Branches</button>
+                        <button data-simple-git-action="log" class="git-repo-command h-10 rounded-xl border border-slate-700/25 bg-[#071c29] px-3 text-[11px] font-bold text-slate-300 hover:border-cyan-400/25 hover:text-cyan-200">Log</button>
+                        <button data-simple-git-action="diff" class="git-repo-command h-10 rounded-xl border border-slate-700/25 bg-[#071c29] px-3 text-[11px] font-bold text-slate-300 hover:border-cyan-400/25 hover:text-cyan-200">Diff</button>
+                        <button data-simple-git-action="remote" class="git-repo-command h-10 rounded-xl border border-slate-700/25 bg-[#071c29] px-3 text-[11px] font-bold text-slate-300 hover:border-cyan-400/25 hover:text-cyan-200">Remote</button>
+                        <button data-simple-git-action="fetch" class="git-repo-command h-10 rounded-xl border border-blue-400/20 bg-blue-400/5 px-3 text-[11px] font-bold text-blue-200 hover:bg-blue-400/10">Fetch</button>
+                        <button data-simple-git-action="pull_rebase" class="git-repo-command h-10 rounded-xl border border-blue-400/20 bg-blue-400/5 px-3 text-[11px] font-bold text-blue-200 hover:bg-blue-400/10">Pull --rebase</button>
+                        <button data-simple-git-action="push" class="git-repo-command h-10 rounded-xl border border-emerald-400/20 bg-emerald-400/5 px-3 text-[11px] font-bold text-emerald-200 hover:bg-emerald-400/10">Push</button>
+                    </div>
+                </div>
+
+                <div class="mt-5 grid gap-4 xl:grid-cols-2 2xl:grid-cols-4">
+                    <!-- INIT / CLONE -->
+                    <div class="action-card rounded-xl p-4">
+                        <div class="flex items-center justify-between">
+                            <h4 class="text-sm font-bold text-slate-200">Repositório</h4>
+                            <span class="text-lg">⌘</span>
+                        </div>
+                        <p class="mt-1 text-[10px] leading-4 text-slate-600">Inicialize a pasta ativa ou clone outro repositório.</p>
+
+                        <button id="gitInitBtn" class="mt-3 h-10 w-full rounded-lg border border-cyan-400/20 bg-cyan-400/5 text-[11px] font-bold text-cyan-200 hover:bg-cyan-400/10">
+                            git init
+                        </button>
+
+                        <div class="mt-4 border-t border-slate-700/20 pt-4">
+                            <label class="block">
+                                <span class="mb-1 block text-[9px] font-bold uppercase tracking-[.08em] text-slate-600">URL HTTPS / SSH</span>
+                                <input id="gitCloneUrlInput" placeholder="https://github.com/usuario/projeto.git" class="h-10 w-full rounded-lg border border-slate-700/30 bg-[#061722] px-3 text-xs text-slate-200 outline-none focus:border-cyan-400/35">
+                            </label>
+
+                            <div class="mt-2 grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+                                <input id="gitCloneParentInput" placeholder="Pasta-pai de destino" class="h-10 min-w-0 rounded-lg border border-slate-700/30 bg-[#061722] px-3 text-xs text-slate-200 outline-none focus:border-cyan-400/35">
+                                <button id="browseCloneParentBtn" class="h-10 rounded-lg border border-slate-700/30 bg-[#091c29] px-3 text-[11px] font-bold text-slate-300 hover:text-cyan-200">📁</button>
+                            </div>
+
+                            <input id="gitCloneFolderInput" placeholder="Nome da pasta (opcional)" class="mt-2 h-10 w-full rounded-lg border border-slate-700/30 bg-[#061722] px-3 text-xs text-slate-200 outline-none focus:border-cyan-400/35">
+
+                            <button id="gitCloneBtn" class="mt-2 h-10 w-full rounded-lg border border-blue-400/20 bg-blue-400/5 text-[11px] font-bold text-blue-200 hover:bg-blue-400/10">
+                                git clone
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- ADD / COMMIT -->
+                    <div class="action-card rounded-xl p-4">
+                        <div class="flex items-center justify-between">
+                            <h4 class="text-sm font-bold text-slate-200">Stage &amp; Commit</h4>
+                            <span class="text-lg">＋</span>
+                        </div>
+                        <p class="mt-1 text-[10px] leading-4 text-slate-600">Add e Commit passam pela auditoria de segurança.</p>
+
+                        <label class="mt-3 block">
+                            <span class="mb-1 block text-[9px] font-bold uppercase tracking-[.08em] text-slate-600">Arquivo/pasta para Add</span>
+                            <input id="gitAddPathInput" placeholder="vazio = git add -A" class="h-10 w-full rounded-lg border border-slate-700/30 bg-[#061722] px-3 text-xs text-slate-200 outline-none focus:border-cyan-400/35">
+                        </label>
+
+                        <button id="gitAddBtn" class="mt-2 h-10 w-full rounded-lg border border-cyan-400/20 bg-cyan-400/5 text-[11px] font-bold text-cyan-200 hover:bg-cyan-400/10">
+                            git add
+                        </button>
+
+                        <label class="mt-3 block">
+                            <span class="mb-1 block text-[9px] font-bold uppercase tracking-[.08em] text-slate-600">Mensagem do Commit</span>
+                            <input id="gitCommitMessageInput" maxlength="240" placeholder="Descrição da alteração" class="h-10 w-full rounded-lg border border-slate-700/30 bg-[#061722] px-3 text-xs text-slate-200 outline-none focus:border-cyan-400/35">
+                        </label>
+
+                        <button id="gitCommitBtn" class="mt-2 h-10 w-full rounded-lg border border-emerald-400/20 bg-emerald-400/5 text-[11px] font-bold text-emerald-200 hover:bg-emerald-400/10">
+                            git commit
+                        </button>
+                    </div>
+
+                    <!-- SWITCH / BRANCH -->
+                    <div class="action-card rounded-xl p-4">
+                        <div class="flex items-center justify-between">
+                            <h4 class="text-sm font-bold text-slate-200">Switch &amp; Branch</h4>
+                            <span class="text-lg">⑂</span>
+                        </div>
+                        <p class="mt-1 text-[10px] leading-4 text-slate-600">Troque, crie ou remova branches locais.</p>
+
+                        <label class="mt-3 block">
+                            <span class="mb-1 block text-[9px] font-bold uppercase tracking-[.08em] text-slate-600">Branch</span>
+                            <input id="gitBranchNameInput" placeholder="feature/minha-alteracao" class="h-10 w-full rounded-lg border border-slate-700/30 bg-[#061722] px-3 text-xs text-slate-200 outline-none focus:border-cyan-400/35">
+                        </label>
+
+                        <div class="mt-2 grid grid-cols-2 gap-2">
+                            <button id="gitSwitchBtn" class="h-10 rounded-lg border border-cyan-400/20 bg-cyan-400/5 text-[11px] font-bold text-cyan-200 hover:bg-cyan-400/10">Switch</button>
+                            <button id="gitSwitchCreateBtn" class="h-10 rounded-lg border border-blue-400/20 bg-blue-400/5 text-[11px] font-bold text-blue-200 hover:bg-blue-400/10">Criar + Switch</button>
+                        </div>
+
+                        <button id="gitBranchCreateBtn" class="mt-2 h-10 w-full rounded-lg border border-slate-700/30 bg-[#071c29] text-[11px] font-bold text-slate-300 hover:text-cyan-200">
+                            Criar branch sem trocar
+                        </button>
+
+                        <label class="mt-3 flex items-center gap-2 text-[10px] text-slate-500">
+                            <input id="gitBranchForceDeleteInput" type="checkbox" class="accent-red-400">
+                            Forçar exclusão (-D) se não estiver mesclada
+                        </label>
+
+                        <button id="gitBranchDeleteBtn" class="mt-2 h-10 w-full rounded-lg border border-red-900/35 bg-red-950/20 text-[11px] font-bold text-red-300 hover:bg-red-950/35">
+                            Excluir branch local
+                        </button>
+                    </div>
+
+                    <!-- RM CACHED -->
+                    <div class="action-card rounded-xl p-4">
+                        <div class="flex items-center justify-between">
+                            <h4 class="text-sm font-bold text-slate-200">Remover do Git</h4>
+                            <span class="text-lg">⊘</span>
+                        </div>
+                        <p class="mt-1 text-[10px] leading-4 text-slate-600">
+                            Equivale a <strong class="font-bold text-slate-400">git rm --cached</strong>: retira do índice sem apagar do computador.
+                        </p>
+
+                        <label class="mt-3 block">
+                            <span class="mb-1 block text-[9px] font-bold uppercase tracking-[.08em] text-slate-600">Arquivo ou pasta</span>
+                            <input id="gitRmCachedPathInput" placeholder="release/test" class="h-10 w-full rounded-lg border border-slate-700/30 bg-[#061722] px-3 text-xs text-slate-200 outline-none focus:border-red-400/35">
+                        </label>
+
+                        <button id="gitRmCachedBtn" class="mt-2 h-10 w-full rounded-lg border border-red-900/35 bg-red-950/20 text-[11px] font-bold text-red-300 hover:bg-red-950/35">
+                            Remover somente do índice
+                        </button>
+
+                        <div class="mt-4 rounded-lg border border-slate-700/20 bg-[#061722] p-3 text-[10px] leading-4 text-slate-600">
+                            O Dashboard não disponibiliza <strong class="text-slate-400">reset --hard</strong>, limpeza forçada ou comandos shell arbitrários.
+                        </div>
+                    </div>
+                </div>
+
+                <div id="gitIndividualResult" class="mt-4 hidden rounded-xl border border-slate-700/25 bg-[#061722] px-4 py-3 text-xs text-slate-400"></div>
+            </section>
+
             <!-- LOG / DETALHES -->
             <section class="panel mt-5 rounded-2xl p-5">
                 <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -10802,12 +13193,101 @@ GIT_GITHUB_HTML = r"""
         </main>
     </div>
 
+
+    <div id="githubRepoCreateModal" class="modal-shell fixed inset-0 z-[80] hidden items-center justify-center p-4">
+        <div class="panel max-h-[92vh] w-full max-w-xl overflow-y-auto rounded-2xl p-5 shadow-2xl">
+            <div class="flex items-start justify-between gap-4">
+                <div><h3 class="text-lg font-bold text-slate-100">Novo repositório GitHub</h3><p class="mt-1 text-xs text-slate-500">Cria na conta autenticada pelo GitHub CLI.</p></div>
+                <button data-close-modal="githubRepoCreateModal" class="rounded-lg px-2 py-1 text-slate-500">✕</button>
+            </div>
+            <div class="mt-5 grid gap-3">
+                <label><span class="mb-1 block text-[10px] font-bold uppercase text-slate-600">Nome</span><input id="newGithubRepoName" maxlength="100" placeholder="meu-projeto" class="h-11 w-full rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-sm text-slate-200 outline-none"></label>
+                <label><span class="mb-1 block text-[10px] font-bold uppercase text-slate-600">Descrição</span><textarea id="newGithubRepoDescription" rows="3" maxlength="350" class="w-full resize-none rounded-xl border border-slate-700/30 bg-[#061722] px-3 py-3 text-sm text-slate-200 outline-none"></textarea></label>
+                <label><span class="mb-1 block text-[10px] font-bold uppercase text-slate-600">Visibilidade</span><select id="newGithubRepoVisibility" class="h-11 w-full rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-sm text-slate-300 outline-none"><option value="private">Privado</option><option value="public">Público</option></select></label>
+                <label class="flex items-center gap-2 text-xs text-slate-500"><input id="newGithubRepoReadme" type="checkbox" checked class="accent-cyan-400"> Inicializar com README</label>
+                <label class="flex items-center gap-2 text-xs text-slate-500"><input id="newGithubRepoCloneAfter" type="checkbox" class="accent-cyan-400"> Clonar no computador após criar</label>
+                <div id="newGithubRepoCloneArea" class="hidden grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+                    <input id="newGithubRepoParentPath" placeholder="Pasta-pai para o clone" class="h-10 min-w-0 rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-xs text-slate-200 outline-none">
+                    <button id="newGithubRepoBrowseParentBtn" class="h-10 rounded-xl border border-slate-700/30 bg-[#091c29] px-3 text-xs">📁</button>
+                </div>
+            </div>
+            <div class="mt-5 flex justify-end gap-2">
+                <button data-close-modal="githubRepoCreateModal" class="h-10 rounded-xl border border-slate-700/30 px-4 text-xs font-bold text-slate-400">Cancelar</button>
+                <button id="confirmCreateGithubRepoBtn" class="h-10 rounded-xl border border-emerald-400/20 bg-emerald-400/10 px-4 text-xs font-bold text-emerald-200">Criar repositório</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="githubRepoEditModal" class="modal-shell fixed inset-0 z-[80] hidden items-center justify-center p-4">
+        <div class="panel max-h-[92vh] w-full max-w-2xl overflow-y-auto rounded-2xl p-5 shadow-2xl">
+            <div class="flex items-start justify-between gap-4">
+                <div><h3 class="text-lg font-bold text-slate-100">Editar repositório</h3><p id="editGithubRepoFullName" class="mt-1 text-xs text-cyan-300">—</p></div>
+                <button data-close-modal="githubRepoEditModal" class="rounded-lg px-2 py-1 text-slate-500">✕</button>
+            </div>
+            <div class="mt-5 grid gap-3">
+                <label><span class="mb-1 block text-[10px] font-bold uppercase text-slate-600">Descrição</span><textarea id="editGithubRepoDescription" rows="3" maxlength="350" class="w-full resize-none rounded-xl border border-slate-700/30 bg-[#061722] px-3 py-3 text-sm text-slate-200 outline-none"></textarea></label>
+                <label><span class="mb-1 block text-[10px] font-bold uppercase text-slate-600">Homepage</span><input id="editGithubRepoHomepage" maxlength="500" placeholder="https://..." class="h-11 w-full rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-sm text-slate-200 outline-none"></label>
+                <div class="grid gap-3 sm:grid-cols-2">
+                    <label><span class="mb-1 block text-[10px] font-bold uppercase text-slate-600">Visibilidade</span><select id="editGithubRepoVisibility" class="h-11 w-full rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-sm text-slate-300 outline-none"><option value="private">Privado</option><option value="public">Público</option><option value="internal">Interno</option></select></label>
+                    <label><span class="mb-1 block text-[10px] font-bold uppercase text-slate-600">Branch padrão</span><input id="editGithubRepoDefaultBranch" class="h-11 w-full rounded-xl border border-slate-700/30 bg-[#061722] px-3 text-sm text-slate-200 outline-none"></label>
+                </div>
+                <div class="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                    <label class="rounded-xl border border-slate-700/20 bg-[#061722] p-3 text-xs text-slate-400"><input id="editGithubRepoIssues" type="checkbox" class="mr-2 accent-cyan-400"> Issues</label>
+                    <label class="rounded-xl border border-slate-700/20 bg-[#061722] p-3 text-xs text-slate-400"><input id="editGithubRepoProjects" type="checkbox" class="mr-2 accent-cyan-400"> Projects</label>
+                    <label class="rounded-xl border border-slate-700/20 bg-[#061722] p-3 text-xs text-slate-400"><input id="editGithubRepoWiki" type="checkbox" class="mr-2 accent-cyan-400"> Wiki</label>
+                </div>
+                <div class="mt-2 rounded-xl border border-red-900/25 bg-red-950/10 p-4">
+                    <div class="text-[10px] font-bold uppercase tracking-[.10em] text-red-300/80">Administração avançada</div>
+                    <div class="mt-3 grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
+                        <input id="renameGithubRepoName" placeholder="novo-nome" class="h-10 min-w-0 rounded-lg border border-slate-700/30 bg-[#061722] px-3 text-xs text-slate-200 outline-none">
+                        <button id="renameGithubRepoBtn" class="h-10 rounded-lg border border-amber-400/20 bg-amber-400/5 px-4 text-xs font-bold text-amber-200">Renomear</button>
+                    </div>
+                    <div class="mt-3 flex flex-wrap gap-2">
+                        <button id="archiveGithubRepoBtn" class="h-9 rounded-lg border border-amber-400/20 bg-amber-400/5 px-3 text-[10px] font-bold text-amber-200">Arquivar</button>
+                        <button id="deleteGithubRepoBtn" class="h-9 rounded-lg border border-red-900/40 bg-red-950/30 px-3 text-[10px] font-bold text-red-300">Excluir permanentemente</button>
+                    </div>
+                </div>
+            </div>
+            <div class="mt-5 flex justify-end gap-2">
+                <button data-close-modal="githubRepoEditModal" class="h-10 rounded-xl border border-slate-700/30 px-4 text-xs font-bold text-slate-400">Cancelar</button>
+                <button id="confirmEditGithubRepoBtn" class="h-10 rounded-xl border border-cyan-400/20 bg-cyan-400/10 px-4 text-xs font-bold text-cyan-200">Salvar alterações</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="githubRepoCloneModal" class="modal-shell fixed inset-0 z-[80] hidden items-center justify-center p-4">
+        <div class="panel w-full max-w-lg rounded-2xl p-5 shadow-2xl">
+            <div class="flex items-start justify-between gap-4">
+                <div><h3 class="text-lg font-bold text-slate-100">Clonar repositório</h3><p id="cloneGithubRepoFullName" class="mt-1 text-xs text-cyan-300">—</p></div>
+                <button data-close-modal="githubRepoCloneModal" class="rounded-lg px-2 py-1 text-slate-500">✕</button>
+            </div>
+            <div class="mt-5">
+                <span class="mb-1 block text-[10px] font-bold uppercase text-slate-600">Pasta-pai</span>
+                <div class="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+                    <input id="cloneGithubRepoParentPath" class="h-10 min-w-0 rounded-lg border border-slate-700/30 bg-[#061722] px-3 text-xs text-slate-200 outline-none">
+                    <button id="cloneGithubRepoBrowseParentBtn" class="h-10 rounded-lg border border-slate-700/30 bg-[#091c29] px-3 text-xs">📁</button>
+                </div>
+                <label class="mt-3 block"><span class="mb-1 block text-[10px] font-bold uppercase text-slate-600">Nome da pasta</span><input id="cloneGithubRepoFolderName" class="h-10 w-full rounded-lg border border-slate-700/30 bg-[#061722] px-3 text-xs text-slate-200 outline-none"></label>
+            </div>
+            <div class="mt-5 flex justify-end gap-2">
+                <button data-close-modal="githubRepoCloneModal" class="h-10 rounded-xl border border-slate-700/30 px-4 text-xs font-bold text-slate-400">Cancelar</button>
+                <button id="confirmCloneGithubRepoBtn" class="h-10 rounded-xl border border-blue-400/20 bg-blue-400/10 px-4 text-xs font-bold text-blue-200">Clonar e selecionar</button>
+            </div>
+        </div>
+    </div>
+
+
     <div id="gitToast" class="pointer-events-none fixed bottom-5 right-5 z-[70] hidden max-w-sm rounded-xl border px-4 py-3 text-sm shadow-2xl"></div>
 
     <script>
         const state = {
             environment: null,
-            audit: null
+            audit: null,
+            githubRepos: [],
+            githubRepoSummary: {},
+            githubLogin: '',
+            editingGithubRepo: null,
+            cloningGithubRepo: null
         };
 
         const environmentMessage = document.getElementById('environmentMessage');
@@ -10839,6 +13319,16 @@ GIT_GITHUB_HTML = r"""
 
         const gitActionLog = document.getElementById('gitActionLog');
         const gitToast = document.getElementById('gitToast');
+
+
+        const githubRepoGrid = document.getElementById('githubRepoGrid');
+        const githubReposLoading = document.getElementById('githubReposLoading');
+        const githubReposError = document.getElementById('githubReposError');
+        const githubRepoSearchInput = document.getElementById('githubRepoSearchInput');
+        const githubRepoVisibilityFilter = document.getElementById('githubRepoVisibilityFilter');
+        const githubRepoStateFilter = document.getElementById('githubRepoStateFilter');
+        const githubRepoSortSelect = document.getElementById('githubRepoSortSelect');
+        const githubRepoScopeSelect = document.getElementById('githubRepoScopeSelect');
 
         function escapeHtml(value) {
             return String(value ?? '')
@@ -11040,9 +13530,17 @@ GIT_GITHUB_HTML = r"""
                     ? `Repositório: ${data.repo_root}${data.behind ? ` • remoto +${data.behind}` : ''}${data.ahead ? ` • local +${data.ahead}` : ''}`
                     : (data.source_reason || 'Git indisponível para o projeto selecionado.');
 
-                ghStatus.textContent = data.gh_authenticated
-                    ? 'Autenticado'
-                    : (data.gh_installed ? 'Login necessário' : 'Não instalado');
+                if (data.gh_authenticated) {
+                    ghStatus.textContent = data.gh_detection_source
+                        ? `Autenticado • ${data.gh_detection_source}`
+                        : 'Autenticado';
+                } else if (data.gh_installed) {
+                    ghStatus.textContent = data.gh_detection_source
+                        ? `Login necessário • ${data.gh_detection_source}`
+                        : 'Login necessário';
+                } else {
+                    ghStatus.textContent = 'Não localizado';
+                }
 
                 const assets = data.release_assets || {};
                 renderReleaseAssets(assets);
@@ -11070,12 +13568,67 @@ GIT_GITHUB_HTML = r"""
                 }
 
                 const actionsAvailable = Boolean(data.source_mode);
+                const hasSelectedFolder = Boolean(data.selected_project?.path);
+                const isGitRepo = Boolean(data.selected_project?.is_git);
 
                 document.getElementById('runSecurityAuditBtn').disabled = !actionsAvailable;
                 document.getElementById('publishGitBtn').disabled = !actionsAvailable;
                 document.getElementById('createReleaseBtn').disabled =
                     !actionsAvailable ||
                     !data.gh_authenticated;
+
+                document.getElementById('gitInitBtn').disabled =
+                    !data.git_installed ||
+                    !hasSelectedFolder ||
+                    isGitRepo;
+
+                document.querySelectorAll('.git-repo-command').forEach(button => {
+                    button.disabled = !isGitRepo;
+                    button.classList.toggle('opacity-40', !isGitRepo);
+                    button.classList.toggle('cursor-not-allowed', !isGitRepo);
+                });
+
+                [
+                    'gitAddBtn',
+                    'gitCommitBtn',
+                    'gitSwitchBtn',
+                    'gitSwitchCreateBtn',
+                    'gitBranchCreateBtn',
+                    'gitBranchDeleteBtn',
+                    'gitRmCachedBtn'
+                ].forEach(id => {
+                    const button = document.getElementById(id);
+                    button.disabled = !isGitRepo;
+                    button.classList.toggle('opacity-40', !isGitRepo);
+                    button.classList.toggle('cursor-not-allowed', !isGitRepo);
+                });
+
+                const commandBadge = document.getElementById('gitIndividualRepoBadge');
+                commandBadge.textContent = isGitRepo
+                    ? `${data.selected_project.name || 'Projeto'} • ${data.branch || 'HEAD'}`
+                    : (hasSelectedFolder ? 'pasta sem Git' : 'sem projeto');
+
+                commandBadge.className =
+                    'rounded-lg border bg-[#061722] px-3 py-1.5 text-[10px] font-bold uppercase tracking-[.08em] ' +
+                    (isGitRepo
+                        ? 'border-emerald-400/20 text-emerald-300'
+                        : 'border-amber-400/20 text-amber-200');
+
+                const cloneParent = document.getElementById('gitCloneParentInput');
+                if (!cloneParent.value && data.selected_project?.path) {
+                    const currentPath = data.selected_project.path;
+                    const separator = currentPath.includes('\\') ? '\\' : '/';
+                    const parts = currentPath.split(/[\\/]/).filter(Boolean);
+
+                    if (parts.length > 1) {
+                        const isWindowsDrive = /^[A-Za-z]:/.test(currentPath);
+                        if (isWindowsDrive) {
+                            cloneParent.value = parts.slice(0, -1).join('\\');
+                        } else {
+                            cloneParent.value = '/' + parts.slice(0, -1).join('/');
+                        }
+                    }
+                }
 
             } catch (error) {
                 showToast(error.message || 'Erro ao carregar status.', true);
@@ -11250,6 +13803,765 @@ GIT_GITHUB_HTML = r"""
             }
         }
 
+
+        const gitIndividualResult = document.getElementById('gitIndividualResult');
+
+
+        function formatRepoDate(value) {
+            if (!value) return '—';
+            const date = new Date(value);
+            if (Number.isNaN(date.getTime())) return value;
+            return date.toLocaleDateString('pt-BR');
+        }
+
+        function formatRepoSize(sizeKb) {
+            const kb = Number(sizeKb || 0);
+            if (kb < 1024) return `${kb} KB`;
+            const mb = kb / 1024;
+            if (mb < 1024) return `${mb.toFixed(mb >= 100 ? 0 : 1)} MB`;
+            return `${(mb / 1024).toFixed(2)} GB`;
+        }
+
+        function openModal(id) {
+            const modal = document.getElementById(id);
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+        }
+
+        function closeModal(id) {
+            const modal = document.getElementById(id);
+            modal.classList.add('hidden');
+            modal.classList.remove('flex');
+        }
+
+        async function browseFolderForInput(inputId) {
+            try {
+                const response = await fetch('/api/git-dashboard/browse-folder', { method: 'POST' });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || 'Falha ao selecionar pasta.');
+                if (data.path) document.getElementById(inputId).value = data.path;
+            } catch (error) {
+                showToast(error.message || 'Erro ao selecionar pasta.', true);
+            }
+        }
+
+        function repoVisibilityBadge(repo) {
+            if (repo.visibility === 'private') return '<span class="rounded-md border border-violet-400/20 bg-violet-400/5 px-2 py-0.5 text-[9px] font-bold uppercase text-violet-200">Privado</span>';
+            if (repo.visibility === 'internal') return '<span class="rounded-md border border-amber-400/20 bg-amber-400/5 px-2 py-0.5 text-[9px] font-bold uppercase text-amber-200">Interno</span>';
+            return '<span class="rounded-md border border-cyan-400/20 bg-cyan-400/5 px-2 py-0.5 text-[9px] font-bold uppercase text-cyan-200">Público</span>';
+        }
+
+        function getFilteredGithubRepos() {
+            const query = githubRepoSearchInput.value.trim().toLowerCase();
+            const visibility = githubRepoVisibilityFilter.value;
+            const stateFilter = githubRepoStateFilter.value;
+            const sort = githubRepoSortSelect.value;
+            let repos = [...state.githubRepos];
+
+            if (query) {
+                repos = repos.filter(repo => [
+                    repo.full_name, repo.description, repo.language, repo.default_branch
+                ].join(' ').toLowerCase().includes(query));
+            }
+
+            if (visibility !== 'all') repos = repos.filter(repo => repo.visibility === visibility);
+            if (stateFilter === 'active') repos = repos.filter(repo => !repo.archived);
+            else if (stateFilter === 'archived') repos = repos.filter(repo => repo.archived);
+            else if (stateFilter === 'local') repos = repos.filter(repo => Boolean(repo.local));
+            else if (stateFilter === 'fork') repos = repos.filter(repo => repo.fork);
+
+            if (sort === 'name') repos.sort((a, b) => a.full_name.localeCompare(b.full_name, 'pt-BR'));
+            else if (sort === 'stars') repos.sort((a, b) => Number(b.stars || 0) - Number(a.stars || 0));
+            else if (sort === 'size') repos.sort((a, b) => Number(b.size_kb || 0) - Number(a.size_kb || 0));
+            else repos.sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')));
+
+            return repos;
+        }
+
+        function renderGithubRepos() {
+            const repos = getFilteredGithubRepos();
+            document.getElementById('githubRepoFilteredCount').textContent =
+                `${repos.length} exibido(s) de ${state.githubRepos.length}`;
+
+            if (!repos.length) {
+                githubRepoGrid.innerHTML = '<div class="md:col-span-2 2xl:col-span-3 rounded-xl border border-slate-700/20 bg-[#061722] p-6 text-center text-xs text-slate-500">Nenhum repositório corresponde aos filtros.</div>';
+                return;
+            }
+
+            githubRepoGrid.innerHTML = repos.map(repo => {
+                const local = repo.local || null;
+                const canAdmin = Boolean(repo.can_admin);
+
+                return `
+                    <article class="repo-card min-w-0 rounded-2xl p-4">
+                        <div class="flex items-start justify-between gap-3">
+                            <div class="min-w-0">
+                                <div class="flex flex-wrap items-center gap-2">
+                                    ${repoVisibilityBadge(repo)}
+                                    ${repo.archived ? '<span class="rounded-md border border-amber-400/20 px-2 py-0.5 text-[9px] font-bold uppercase text-amber-200">Arquivado</span>' : ''}
+                                    ${repo.fork ? '<span class="rounded-md border border-slate-600/30 px-2 py-0.5 text-[9px] font-bold uppercase text-slate-400">Fork</span>' : ''}
+                                    ${local ? '<span class="rounded-md border border-emerald-400/20 bg-emerald-400/5 px-2 py-0.5 text-[9px] font-bold uppercase text-emerald-200">No PC</span>' : ''}
+                                </div>
+                                <h4 class="mt-2 truncate text-sm font-bold text-slate-100">${escapeHtml(repo.name)}</h4>
+                                <div class="mt-0.5 truncate text-[10px] text-slate-600">${escapeHtml(repo.full_name)}</div>
+                            </div>
+                            <a href="${escapeHtml(repo.url)}" target="_blank" rel="noopener noreferrer" class="shrink-0 rounded-lg border border-slate-700/25 px-2.5 py-1.5 text-[10px] font-bold text-slate-400 hover:text-cyan-200">GitHub ↗</a>
+                        </div>
+
+                        <p class="mt-3 min-h-[40px] text-xs leading-5 text-slate-500">${escapeHtml(repo.description || 'Sem descrição.')}</p>
+
+                        <div class="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-slate-600">
+                            <span>${repo.language ? `● ${escapeHtml(repo.language)}` : '● —'}</span>
+                            <span>★ ${Number(repo.stars || 0)}</span>
+                            <span>⑂ ${Number(repo.forks || 0)}</span>
+                            <span>Issues ${Number(repo.open_issues || 0)}</span>
+                            <span>${formatRepoSize(repo.size_kb)}</span>
+                        </div>
+
+                        <div class="mt-3 border-t border-slate-700/15 pt-3 text-[10px] text-slate-600">
+                            <div class="flex justify-between gap-3">
+                                <span>Branch: <strong class="font-semibold text-slate-400">${escapeHtml(repo.default_branch || '—')}</strong></span>
+                                <span>${escapeHtml(formatRepoDate(repo.updated_at))}</span>
+                            </div>
+                            ${local ? `<div class="mt-1 truncate" title="${escapeHtml(local.path)}">Local: <span class="text-emerald-300/75">${escapeHtml(local.path)}</span>${local.changed_files ? ` • ${local.changed_files} alteração(ões)` : ''}</div>` : ''}
+                        </div>
+
+                        <div class="mt-4 grid grid-cols-2 gap-2">
+                            ${local
+                                ? `<button data-repo-action="select_local" data-repo="${escapeHtml(repo.full_name)}" class="h-9 rounded-lg border border-emerald-400/20 bg-emerald-400/5 px-3 text-[10px] font-bold text-emerald-200">Usar projeto local</button>`
+                                : `<button data-repo-action="clone" data-repo="${escapeHtml(repo.full_name)}" class="h-9 rounded-lg border border-blue-400/20 bg-blue-400/5 px-3 text-[10px] font-bold text-blue-200">Clonar</button>`
+                            }
+                            <button data-repo-action="edit" data-repo="${escapeHtml(repo.full_name)}" class="h-9 rounded-lg border border-cyan-400/20 bg-cyan-400/5 px-3 text-[10px] font-bold text-cyan-200 ${canAdmin ? '' : 'opacity-40 cursor-not-allowed'}" ${canAdmin ? '' : 'disabled'}>Editar</button>
+                            <button data-repo-action="${repo.archived ? 'unarchive' : 'archive'}" data-repo="${escapeHtml(repo.full_name)}" class="h-9 rounded-lg border border-amber-400/20 bg-amber-400/5 px-3 text-[10px] font-bold text-amber-200 ${canAdmin ? '' : 'opacity-40 cursor-not-allowed'}" ${canAdmin ? '' : 'disabled'}>${repo.archived ? 'Restaurar' : 'Arquivar'}</button>
+                            <button data-repo-action="copy" data-repo="${escapeHtml(repo.full_name)}" class="h-9 rounded-lg border border-slate-700/25 bg-[#071c29] px-3 text-[10px] font-bold text-slate-400">Copiar URL</button>
+                        </div>
+                    </article>
+                `;
+            }).join('');
+
+            githubRepoGrid.querySelectorAll('[data-repo-action]').forEach(button => {
+                button.addEventListener('click', () => handleGithubRepoCardAction(
+                    button.dataset.repoAction,
+                    button.dataset.repo
+                ));
+            });
+        }
+
+        async function loadGithubRepositories() {
+            githubReposLoading.classList.remove('hidden');
+            githubReposError.classList.add('hidden');
+            document.getElementById('refreshGithubReposBtn').disabled = true;
+
+            try {
+                const response = await fetch(
+                    `/api/github/repos?scope=${encodeURIComponent(githubRepoScopeSelect.value || 'owner')}`,
+                    { cache: 'no-store' }
+                );
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || 'Falha ao consultar repositórios.');
+
+                state.githubRepos = Array.isArray(data.repositories) ? data.repositories : [];
+                state.githubRepoSummary = data.summary || {};
+                state.githubLogin = data.login || '';
+
+                document.getElementById('githubRepoAccountMessage').textContent =
+                    data.login ? `Conta: @${data.login} • consulta via GitHub CLI` : 'Conta GitHub autenticada';
+                document.getElementById('repoCountTotal').textContent = data.summary?.total ?? 0;
+                document.getElementById('repoCountPublic').textContent = data.summary?.public ?? 0;
+                document.getElementById('repoCountPrivate').textContent = data.summary?.private ?? 0;
+                document.getElementById('repoCountLocal').textContent = data.summary?.local ?? 0;
+                document.getElementById('repoCountArchived').textContent = data.summary?.archived ?? 0;
+                document.getElementById('repoCountForks').textContent = data.summary?.forks ?? 0;
+
+                renderGithubRepos();
+            } catch (error) {
+                state.githubRepos = [];
+                githubRepoGrid.innerHTML = '';
+                githubReposError.textContent = error.message || String(error);
+                githubReposError.classList.remove('hidden');
+                document.getElementById('githubRepoAccountMessage').textContent =
+                    'GitHub indisponível. Verifique gh --version e gh auth status.';
+            } finally {
+                githubReposLoading.classList.add('hidden');
+                document.getElementById('refreshGithubReposBtn').disabled = false;
+            }
+        }
+
+        function findGithubRepo(fullName) {
+            return state.githubRepos.find(repo => repo.full_name === fullName) || null;
+        }
+
+        function openGithubRepoEdit(repo) {
+            state.editingGithubRepo = repo;
+            document.getElementById('editGithubRepoFullName').textContent = repo.full_name;
+            document.getElementById('editGithubRepoDescription').value = repo.description || '';
+            document.getElementById('editGithubRepoHomepage').value = repo.homepage || '';
+            document.getElementById('editGithubRepoVisibility').value = repo.visibility || 'private';
+            document.getElementById('editGithubRepoDefaultBranch').value = repo.default_branch || '';
+            document.getElementById('editGithubRepoIssues').checked = Boolean(repo.has_issues);
+            document.getElementById('editGithubRepoProjects').checked = Boolean(repo.has_projects);
+            document.getElementById('editGithubRepoWiki').checked = Boolean(repo.has_wiki);
+            document.getElementById('renameGithubRepoName').value = repo.name || '';
+            document.getElementById('archiveGithubRepoBtn').textContent =
+                repo.archived ? 'Restaurar repositório' : 'Arquivar repositório';
+            openModal('githubRepoEditModal');
+        }
+
+        function openGithubRepoClone(repo) {
+            state.cloningGithubRepo = repo;
+            document.getElementById('cloneGithubRepoFullName').textContent = repo.full_name;
+            document.getElementById('cloneGithubRepoFolderName').value = repo.name || '';
+            openModal('githubRepoCloneModal');
+        }
+
+        async function githubRepoAction(repo, action, extra = {}) {
+            const response = await fetch('/api/github/repos/action', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    repo,
+                    action,
+                    parent_path: extra.parentPath || '',
+                    folder_name: extra.folderName || '',
+                    new_name: extra.newName || '',
+                    confirmation: extra.confirmation || ''
+                })
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.detail || 'Ação no repositório falhou.');
+            appendLog(`GitHub ${action}: ${repo}\n${data.message || ''}`);
+            showToast(data.message || 'Operação concluída.');
+            return data;
+        }
+
+        async function handleGithubRepoCardAction(action, fullName) {
+            const repo = findGithubRepo(fullName);
+            if (!repo) return;
+
+            if (action === 'copy') {
+                try {
+                    await navigator.clipboard.writeText(repo.clone_url || repo.url);
+                    showToast('URL copiada.');
+                } catch (_) {
+                    showToast('Não foi possível copiar a URL.', true);
+                }
+                return;
+            }
+
+            if (action === 'edit') {
+                openGithubRepoEdit(repo);
+                return;
+            }
+
+            if (action === 'clone') {
+                openGithubRepoClone(repo);
+                return;
+            }
+
+            if (action === 'select_local') {
+                try {
+                    await githubRepoAction(repo.full_name, 'select_local');
+                    await loadEnvironment({ resetReleaseFields: true });
+                    await loadGithubRepositories();
+                } catch (error) {
+                    showToast(error.message || String(error), true);
+                }
+                return;
+            }
+
+            if (action === 'archive' || action === 'unarchive') {
+                const verb = action === 'archive' ? 'arquivar' : 'restaurar';
+                if (!window.confirm(`Deseja ${verb} ${repo.full_name}?`)) return;
+                try {
+                    await githubRepoAction(repo.full_name, action);
+                    await loadGithubRepositories();
+                } catch (error) {
+                    showToast(error.message || String(error), true);
+                }
+            }
+        }
+
+        async function createGithubRepo() {
+            const name = document.getElementById('newGithubRepoName').value.trim();
+            const visibility = document.getElementById('newGithubRepoVisibility').value;
+
+            if (!name) {
+                showToast('Informe o nome do repositório.', true);
+                return;
+            }
+
+            if (
+                visibility === 'public'
+                && !window.confirm(`Criar "${name}" como repositório PÚBLICO? O código ficará visível na internet.`)
+            ) return;
+
+            const button = document.getElementById('confirmCreateGithubRepoBtn');
+            button.disabled = true;
+            button.textContent = 'Criando...';
+
+            try {
+                const response = await fetch('/api/github/repos/create', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        name,
+                        description: document.getElementById('newGithubRepoDescription').value.trim(),
+                        visibility,
+                        add_readme: document.getElementById('newGithubRepoReadme').checked,
+                        clone_after: document.getElementById('newGithubRepoCloneAfter').checked,
+                        parent_path: document.getElementById('newGithubRepoParentPath').value.trim()
+                    })
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || 'Falha ao criar repositório.');
+
+                closeModal('githubRepoCreateModal');
+                appendLog(`GitHub create: ${data.repo}\n${data.message || ''}`);
+                showToast(data.message || 'Repositório criado.');
+                await loadEnvironment({ resetReleaseFields: true });
+                await loadGithubRepositories();
+            } catch (error) {
+                showToast(error.message || String(error), true);
+            } finally {
+                button.disabled = false;
+                button.textContent = 'Criar repositório';
+            }
+        }
+
+        async function saveGithubRepoEdit() {
+            const repo = state.editingGithubRepo;
+            if (!repo) return;
+
+            const visibility = document.getElementById('editGithubRepoVisibility').value;
+            let confirmPublic = false;
+
+            if (visibility === 'public' && repo.visibility !== 'public') {
+                confirmPublic = window.confirm(
+                    `ATENÇÃO: ${repo.full_name} ficará PÚBLICO e o código será visível na internet. Confirmar?`
+                );
+                if (!confirmPublic) return;
+            }
+
+            const button = document.getElementById('confirmEditGithubRepoBtn');
+            button.disabled = true;
+            button.textContent = 'Salvando...';
+
+            try {
+                const response = await fetch('/api/github/repos/edit', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        repo: repo.full_name,
+                        description: document.getElementById('editGithubRepoDescription').value.trim(),
+                        homepage: document.getElementById('editGithubRepoHomepage').value.trim(),
+                        visibility,
+                        has_issues: document.getElementById('editGithubRepoIssues').checked,
+                        has_projects: document.getElementById('editGithubRepoProjects').checked,
+                        has_wiki: document.getElementById('editGithubRepoWiki').checked,
+                        default_branch: document.getElementById('editGithubRepoDefaultBranch').value.trim(),
+                        confirm_public: confirmPublic
+                    })
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || 'Falha ao editar repositório.');
+
+                closeModal('githubRepoEditModal');
+                appendLog(`GitHub edit: ${repo.full_name}\n${data.message || ''}`);
+                showToast(data.message || 'Repositório atualizado.');
+                await loadGithubRepositories();
+            } catch (error) {
+                showToast(error.message || String(error), true);
+            } finally {
+                button.disabled = false;
+                button.textContent = 'Salvar alterações';
+            }
+        }
+
+        async function cloneGithubRepo() {
+            const repo = state.cloningGithubRepo;
+            if (!repo) return;
+
+            const parentPath = document.getElementById('cloneGithubRepoParentPath').value.trim();
+            if (!parentPath) {
+                showToast('Selecione a pasta-pai para o clone.', true);
+                return;
+            }
+
+            const button = document.getElementById('confirmCloneGithubRepoBtn');
+            button.disabled = true;
+            button.textContent = 'Clonando...';
+
+            try {
+                await githubRepoAction(repo.full_name, 'clone', {
+                    parentPath,
+                    folderName: document.getElementById('cloneGithubRepoFolderName').value.trim()
+                });
+                closeModal('githubRepoCloneModal');
+                await loadEnvironment({ resetReleaseFields: true });
+                await loadGithubRepositories();
+            } catch (error) {
+                showToast(error.message || String(error), true);
+            } finally {
+                button.disabled = false;
+                button.textContent = 'Clonar e selecionar';
+            }
+        }
+
+        async function renameGithubRepo() {
+            const repo = state.editingGithubRepo;
+            if (!repo) return;
+
+            const newName = document.getElementById('renameGithubRepoName').value.trim();
+            if (!newName || newName === repo.name) {
+                showToast('Informe um novo nome diferente do atual.', true);
+                return;
+            }
+
+            const confirmation = window.prompt(
+                `Renomear ${repo.full_name} para "${newName}"?\n\nDigite exatamente ${repo.full_name} para confirmar:`
+            );
+            if (confirmation !== repo.full_name) {
+                showToast('Confirmação não corresponde ao repositório.', true);
+                return;
+            }
+
+            try {
+                const data = await githubRepoAction(repo.full_name, 'rename', {
+                    newName,
+                    confirmation
+                });
+                closeModal('githubRepoEditModal');
+                await loadEnvironment({ resetReleaseFields: true });
+                await loadGithubRepositories();
+                if (data.local_remote_updated) {
+                    appendLog('Origin do clone local atualizado automaticamente após o rename.');
+                }
+            } catch (error) {
+                showToast(error.message || String(error), true);
+            }
+        }
+
+        async function archiveGithubRepoFromEdit() {
+            const repo = state.editingGithubRepo;
+            if (!repo) return;
+            const action = repo.archived ? 'unarchive' : 'archive';
+            const verb = repo.archived ? 'restaurar' : 'arquivar';
+            if (!window.confirm(`Deseja ${verb} ${repo.full_name}?`)) return;
+
+            try {
+                await githubRepoAction(repo.full_name, action);
+                closeModal('githubRepoEditModal');
+                await loadGithubRepositories();
+            } catch (error) {
+                showToast(error.message || String(error), true);
+            }
+        }
+
+        async function deleteGithubRepo() {
+            const repo = state.editingGithubRepo;
+            if (!repo) return;
+
+            const confirmation = window.prompt(
+                `EXCLUSÃO PERMANENTE.\n\nO repositório ${repo.full_name} será apagado do GitHub.\nDigite exatamente ${repo.full_name} para confirmar:`
+            );
+            if (confirmation !== repo.full_name) {
+                showToast('Exclusão cancelada: confirmação incorreta.', true);
+                return;
+            }
+
+            if (!window.confirm('Última confirmação: excluir permanentemente este repositório?')) return;
+
+            try {
+                await githubRepoAction(repo.full_name, 'delete', { confirmation });
+                closeModal('githubRepoEditModal');
+                await loadGithubRepositories();
+            } catch (error) {
+                showToast(error.message || String(error), true);
+            }
+        }
+
+        async function runIndividualGitCommand(action, options = {}) {
+            const payload = {
+                action,
+                value: options.value || '',
+                message: options.message || '',
+                create: Boolean(options.create),
+                force: Boolean(options.force),
+                parent_path: options.parentPath || '',
+                folder_name: options.folderName || ''
+            };
+
+            gitIndividualResult.classList.add('hidden');
+
+            try {
+                const response = await fetch('/api/git-dashboard/command', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.detail || `Falha em git ${action}.`);
+                }
+
+                gitIndividualResult.className =
+                    'mt-4 rounded-xl border border-emerald-900/35 bg-emerald-950/15 px-4 py-3 text-xs text-emerald-300';
+
+                gitIndividualResult.innerHTML = `
+                    <div class="font-bold">${escapeHtml(data.message || 'Comando concluído.')}</div>
+                    <div class="mt-1 break-all font-mono text-[10px] text-slate-500">${escapeHtml(data.command || '')}</div>
+                `;
+                gitIndividualResult.classList.remove('hidden');
+
+                appendLog(
+                    `${data.command || `git ${action}`}` +
+                    (data.output ? `\n${data.output}` : '') +
+                    (data.message ? `\n${data.message}` : '')
+                );
+
+                if (data.selected_project_changed) {
+                    showToast('Projeto ativo atualizado.');
+                } else {
+                    showToast(data.message || 'Comando Git concluído.');
+                }
+
+                await loadEnvironment({
+                    resetReleaseFields: Boolean(data.selected_project_changed)
+                });
+
+                return data;
+
+            } catch (error) {
+                gitIndividualResult.className =
+                    'mt-4 rounded-xl border border-red-900/40 bg-red-950/20 px-4 py-3 text-xs text-red-300';
+                gitIndividualResult.textContent = error.message || String(error);
+                gitIndividualResult.classList.remove('hidden');
+
+                appendLog(`ERRO git ${action}: ${error.message || error}`);
+                showToast(error.message || `Erro em git ${action}.`, true);
+                throw error;
+            }
+        }
+
+        async function browseCloneParent() {
+            const button = document.getElementById('browseCloneParentBtn');
+            button.disabled = true;
+
+            try {
+                const response = await fetch('/api/git-dashboard/browse-folder', {
+                    method: 'POST'
+                });
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.detail || 'Falha ao selecionar pasta.');
+                }
+
+                if (data.path) {
+                    document.getElementById('gitCloneParentInput').value = data.path;
+                }
+            } catch (error) {
+                showToast(error.message || 'Erro ao selecionar pasta.', true);
+            } finally {
+                button.disabled = false;
+            }
+        }
+
+        document.querySelectorAll('[data-simple-git-action]').forEach(button => {
+            button.addEventListener('click', async () => {
+                const action = button.dataset.simpleGitAction;
+                const originalText = button.textContent;
+
+                button.disabled = true;
+                button.textContent = '...';
+
+                try {
+                    await runIndividualGitCommand(action);
+                } catch (_) {
+                    // A mensagem já foi exibida no painel.
+                } finally {
+                    button.disabled = false;
+                    button.textContent = originalText;
+                }
+            });
+        });
+
+        document.getElementById('gitInitBtn').addEventListener('click', async () => {
+            try {
+                await runIndividualGitCommand('init');
+            } catch (_) {}
+        });
+
+        document.getElementById('browseCloneParentBtn').addEventListener('click', browseCloneParent);
+
+        document.getElementById('gitCloneBtn').addEventListener('click', async () => {
+            const url = document.getElementById('gitCloneUrlInput').value.trim();
+            const parentPath = document.getElementById('gitCloneParentInput').value.trim();
+            const folderName = document.getElementById('gitCloneFolderInput').value.trim();
+
+            if (!url || !parentPath) {
+                showToast('Informe a URL e a pasta-pai do clone.', true);
+                return;
+            }
+
+            try {
+                await runIndividualGitCommand('clone', {
+                    value: url,
+                    parentPath,
+                    folderName
+                });
+            } catch (_) {}
+        });
+
+        document.getElementById('gitAddBtn').addEventListener('click', async () => {
+            try {
+                await runIndividualGitCommand('add', {
+                    value: document.getElementById('gitAddPathInput').value.trim()
+                });
+            } catch (_) {}
+        });
+
+        document.getElementById('gitCommitBtn').addEventListener('click', async () => {
+            const message = document.getElementById('gitCommitMessageInput').value.trim();
+
+            if (!message) {
+                showToast('Informe a mensagem do commit.', true);
+                return;
+            }
+
+            try {
+                await runIndividualGitCommand('commit', { message });
+            } catch (_) {}
+        });
+
+        document.getElementById('gitSwitchBtn').addEventListener('click', async () => {
+            const branch = document.getElementById('gitBranchNameInput').value.trim();
+            if (!branch) {
+                showToast('Informe a branch.', true);
+                return;
+            }
+            try {
+                await runIndividualGitCommand('switch', { value: branch });
+            } catch (_) {}
+        });
+
+        document.getElementById('gitSwitchCreateBtn').addEventListener('click', async () => {
+            const branch = document.getElementById('gitBranchNameInput').value.trim();
+            if (!branch) {
+                showToast('Informe a nova branch.', true);
+                return;
+            }
+            try {
+                await runIndividualGitCommand('switch', {
+                    value: branch,
+                    create: true
+                });
+            } catch (_) {}
+        });
+
+        document.getElementById('gitBranchCreateBtn').addEventListener('click', async () => {
+            const branch = document.getElementById('gitBranchNameInput').value.trim();
+            if (!branch) {
+                showToast('Informe a nova branch.', true);
+                return;
+            }
+            try {
+                await runIndividualGitCommand('branch_create', { value: branch });
+            } catch (_) {}
+        });
+
+        document.getElementById('gitBranchDeleteBtn').addEventListener('click', async () => {
+            const branch = document.getElementById('gitBranchNameInput').value.trim();
+            if (!branch) {
+                showToast('Informe a branch que será excluída.', true);
+                return;
+            }
+
+            const force = document.getElementById('gitBranchForceDeleteInput').checked;
+            const confirmation = window.confirm(
+                `Excluir a branch local "${branch}"${force ? ' usando -D' : ''}?`
+            );
+
+            if (!confirmation) return;
+
+            try {
+                await runIndividualGitCommand('branch_delete', {
+                    value: branch,
+                    force
+                });
+            } catch (_) {}
+        });
+
+        document.getElementById('gitRmCachedBtn').addEventListener('click', async () => {
+            const path = document.getElementById('gitRmCachedPathInput').value.trim();
+
+            if (!path) {
+                showToast('Informe o arquivo ou pasta.', true);
+                return;
+            }
+
+            const confirmation = window.confirm(
+                `Remover "${path}" somente do índice Git? O arquivo continuará no computador.`
+            );
+            if (!confirmation) return;
+
+            try {
+                await runIndividualGitCommand('rm_cached', { value: path });
+            } catch (_) {}
+        });
+
+
+        document.getElementById('refreshGithubReposBtn').addEventListener('click', loadGithubRepositories);
+        document.getElementById('createGithubRepoBtn').addEventListener('click', () => {
+            document.getElementById('newGithubRepoName').value = '';
+            document.getElementById('newGithubRepoDescription').value = '';
+            document.getElementById('newGithubRepoVisibility').value = 'private';
+            document.getElementById('newGithubRepoReadme').checked = true;
+            document.getElementById('newGithubRepoCloneAfter').checked = false;
+            document.getElementById('newGithubRepoCloneArea').classList.add('hidden');
+            document.getElementById('newGithubRepoParentPath').value = '';
+            openModal('githubRepoCreateModal');
+        });
+
+        githubRepoSearchInput.addEventListener('input', renderGithubRepos);
+        githubRepoVisibilityFilter.addEventListener('change', renderGithubRepos);
+        githubRepoStateFilter.addEventListener('change', renderGithubRepos);
+        githubRepoSortSelect.addEventListener('change', renderGithubRepos);
+        githubRepoScopeSelect.addEventListener('change', loadGithubRepositories);
+
+        document.getElementById('newGithubRepoCloneAfter').addEventListener('change', event => {
+            document.getElementById('newGithubRepoCloneArea').classList.toggle('hidden', !event.target.checked);
+        });
+
+        document.getElementById('newGithubRepoBrowseParentBtn').addEventListener(
+            'click',
+            () => browseFolderForInput('newGithubRepoParentPath')
+        );
+        document.getElementById('cloneGithubRepoBrowseParentBtn').addEventListener(
+            'click',
+            () => browseFolderForInput('cloneGithubRepoParentPath')
+        );
+
+        document.getElementById('confirmCreateGithubRepoBtn').addEventListener('click', createGithubRepo);
+        document.getElementById('confirmEditGithubRepoBtn').addEventListener('click', saveGithubRepoEdit);
+        document.getElementById('confirmCloneGithubRepoBtn').addEventListener('click', cloneGithubRepo);
+        document.getElementById('renameGithubRepoBtn').addEventListener('click', renameGithubRepo);
+        document.getElementById('archiveGithubRepoBtn').addEventListener('click', archiveGithubRepoFromEdit);
+        document.getElementById('deleteGithubRepoBtn').addEventListener('click', deleteGithubRepo);
+
+        document.querySelectorAll('[data-close-modal]').forEach(button => {
+            button.addEventListener('click', () => closeModal(button.dataset.closeModal));
+        });
+
+        ['githubRepoCreateModal', 'githubRepoEditModal', 'githubRepoCloneModal'].forEach(id => {
+            const modal = document.getElementById(id);
+            modal.addEventListener('click', event => {
+                if (event.target === modal) closeModal(id);
+            });
+        });
+
         document.getElementById('refreshGitStatusBtn').addEventListener('click', () => loadEnvironment());
         document.getElementById('chooseProjectFolderBtn').addEventListener('click', chooseProjectFolder);
         document.getElementById('forgetProjectBtn').addEventListener('click', forgetActiveProject);
@@ -11276,6 +14588,7 @@ GIT_GITHUB_HTML = r"""
         });
 
         loadEnvironment({ resetReleaseFields: true });
+        loadGithubRepositories();
     </script>
 </body>
 </html>
@@ -11326,6 +14639,23 @@ def workspace_page() -> HTMLResponse:
 def git_github_page() -> HTMLResponse:
     """Entrega o dashboard local de Git e GitHub."""
     return HTMLResponse(content=GIT_GITHUB_HTML)
+
+
+@app.get("/api/workspace/explorer")
+def workspace_explorer_api(request: Request) -> dict[str, Any]:
+    """Lista projetos reais da raiz local do Workspace."""
+    _local_request_only(request)
+    return workspace_explorer_snapshot()
+
+
+@app.post("/api/workspace/explorer/action")
+def workspace_explorer_action_api(
+    payload: WorkspaceFolderActionRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Executa ações seguras sobre uma pasta listada no Workspace."""
+    _local_request_only(request)
+    return workspace_folder_action(payload)
 
 
 @app.get("/api/projects")
@@ -12457,6 +15787,73 @@ def git_dashboard_forget_project(
     }
 
 
+@app.get("/api/security-policy")
+def get_security_policy(request: Request) -> dict[str, Any]:
+    """Expõe a política de segurança sem dados do usuário."""
+    _local_request_only(request)
+    return security_policy_payload()
+
+
+@app.get("/api/github/repos")
+def github_repositories(
+    request: Request,
+    scope: str = "owner",
+) -> dict[str, Any]:
+    """Lista repositórios da conta GitHub autenticada."""
+    _local_request_only(request)
+    return list_github_repositories(scope)
+
+
+@app.post("/api/github/repos/create")
+def github_repository_create(
+    payload: GitHubRepoCreateRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Cria um repositório na conta GitHub autenticada."""
+    _local_request_only(request)
+    return create_github_repository(payload)
+
+
+@app.post("/api/github/repos/edit")
+def github_repository_edit(
+    payload: GitHubRepoEditRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Edita metadados/configurações de um repositório."""
+    _local_request_only(request)
+    return edit_github_repository(payload)
+
+
+@app.post("/api/github/repos/action")
+def github_repository_action(
+    payload: GitHubRepoActionRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Clone, seleção local, archive, rename e delete."""
+    _local_request_only(request)
+    return manage_github_repository(payload)
+
+
+@app.post("/api/git-dashboard/browse-folder")
+def git_dashboard_browse_folder(
+    request: Request,
+) -> dict[str, str]:
+    """Escolhe uma pasta sem alterar o projeto ativo."""
+    _local_request_only(request)
+    selected_path = _choose_project_folder()
+    return {"path": selected_path}
+
+
+@app.post("/api/git-dashboard/command")
+def git_dashboard_command(
+    payload: GitCommandRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Executa um comando Git individual previamente autorizado."""
+    _local_request_only(request)
+    return execute_individual_git_command(payload)
+
+
 @app.get("/api/git-dashboard/status")
 def git_dashboard_status(request: Request) -> dict[str, Any]:
     """Resumo do projeto ativo, Git, origin, GitHub CLI e Release."""
@@ -12570,24 +15967,15 @@ def open_build_output(request: Request) -> dict[str, str]:
 
 @app.get("/api/links/browser-import/status")
 def browser_import_status(request: Request) -> dict[str, Any]:
-    """Detecta favoritos locais de Chrome, Edge, Brave e Firefox."""
-    client_host = request.client.host if request.client else ""
-
-    if client_host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="A importação de favoritos só pode ser usada neste computador.",
-        )
-
-    if os.name != "nt":
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="A importação automática de navegadores está disponível no Windows.",
-        )
-
-    return {
-        "browsers": browser_bookmarks_status(),
-    }
+    """Leitura de favoritos desativada pela política zero-credenciais."""
+    _local_request_only(request)
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail=(
+            "A leitura de favoritos do navegador foi desativada. "
+            "O TECH TOOL HUB não coleta nem persiste links pessoais."
+        ),
+    )
 
 
 @app.post("/api/links/browser-import")
@@ -12595,103 +15983,15 @@ def import_browser_bookmarks(
     payload: BrowserBookmarksImportRequest,
     request: Request,
 ) -> dict[str, Any]:
-    """Importa favoritos dos navegadores para links_data.json sem duplicar URLs."""
-    client_host = request.client.host if request.client else ""
-
-    if client_host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="A importação de favoritos só pode ser usada neste computador.",
-        )
-
-    if os.name != "nt":
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="A importação automática de navegadores está disponível no Windows.",
-        )
-
-    requested = []
-    for browser_id in payload.browsers:
-        if browser_id in BROWSER_BOOKMARK_SOURCES and browser_id not in requested:
-            requested.append(browser_id)
-
-    if not requested:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Nenhum navegador válido foi selecionado.",
-        )
-
-    candidates: list[dict[str, str]] = []
-    invalid = 0
-
-    for browser_id in requested:
-        source = BROWSER_BOOKMARK_SOURCES[browser_id]
-        browser_name = source["name"]
-
-        for bookmark in read_browser_bookmarks(browser_id):
-            url = str(bookmark.get("url", "")).strip()
-
-            try:
-                validated_url = validate_http_url(url)
-            except HTTPException:
-                invalid += 1
-                continue
-
-            category = (
-                bookmark.get("category", browser_name)
-                if payload.use_folders
-                else browser_name
-            )
-
-            candidates.append({
-                "title": str(bookmark.get("title", "")).strip()[:140] or validated_url,
-                "category": _safe_bookmark_category(str(category), browser_name),
-                "url": validated_url,
-                "note": str(bookmark.get("note", f"Importado do {browser_name}")).strip()[:300],
-            })
-
-    imported = 0
-    duplicates = 0
-
-    with LINKS_LOCK:
-        links = read_links()
-        existing_urls = {
-            str(item.get("url", "")).strip().rstrip("/").casefold()
-            for item in links
-            if isinstance(item, dict) and item.get("url")
-        }
-
-        next_id = max(
-            (int(item.get("id", 0)) for item in links if isinstance(item, dict)),
-            default=0,
-        ) + 1
-
-        for candidate in candidates:
-            normalized = candidate["url"].rstrip("/").casefold()
-
-            if normalized in existing_urls:
-                duplicates += 1
-                continue
-
-            links.append({
-                "id": next_id,
-                **candidate,
-            })
-
-            existing_urls.add(normalized)
-            next_id += 1
-            imported += 1
-
-        if imported:
-            write_links(links)
-
-    return {
-        "message": "Importação concluída.",
-        "imported": imported,
-        "duplicates": duplicates,
-        "invalid": invalid,
-        "requested_browsers": requested,
-    }
+    """Importação desativada pela política zero-credenciais."""
+    _local_request_only(request)
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail=(
+            "A importação de favoritos do navegador foi desativada. "
+            "Links pessoais não são armazenados pelo TECH TOOL HUB."
+        ),
+    )
 
 
 @app.get("/api/links", response_model=list[FavoriteLinkItem])
